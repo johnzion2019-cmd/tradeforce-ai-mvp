@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import main
+from account_security import router as account_security_router
 from fastapi import Request
 from fastapi.responses import PlainTextResponse
 from legal_routes import router as legal_router
@@ -159,6 +160,7 @@ def _rate_limited(request: Request) -> tuple[bool, int]:
 quarantine_legacy_unowned_jobs()
 app.include_router(billing_router)
 app.include_router(legal_router)
+app.include_router(account_security_router)
 
 
 @app.middleware("http")
