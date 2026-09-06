@@ -1,5 +1,10 @@
 """TradeForce AI application entrypoint with Phase 5 billing enabled."""
+import os
+from urllib.parse import urlparse
+
 import main
+from fastapi import Request
+from fastapi.responses import PlainTextResponse
 from main import app
 from phase5_billing import router as billing_router
 
@@ -32,3 +37,23 @@ def quarantine_legacy_unowned_jobs() -> None:
 
 quarantine_legacy_unowned_jobs()
 app.include_router(billing_router)
+
+
+@app.middleware("http")
+async def production_security(request: Request, call_next):
+    """Apply lightweight browser security controls without breaking Stripe webhooks."""
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/stripe/webhook":
+        expected_host = urlparse(os.getenv("APP_BASE_URL", "")).netloc or request.url.netloc
+        origin = request.headers.get("origin")
+        referer = request.headers.get("referer")
+        source_host = urlparse(origin).netloc if origin else (urlparse(referer).netloc if referer else "")
+        if source_host and source_host != expected_host:
+            return PlainTextResponse("Cross-site request blocked.", status_code=403)
+
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
