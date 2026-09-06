@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import main
 from fastapi import Request
 from fastapi.responses import PlainTextResponse
+from legal_routes import router as legal_router
 from main import app
 from phase5_billing import router as billing_router
 
@@ -103,6 +104,7 @@ def validate_worker_uploads(content_type: str, body: bytes) -> str | None:
 
 quarantine_legacy_unowned_jobs()
 app.include_router(billing_router)
+app.include_router(legal_router)
 
 
 @app.middleware("http")
