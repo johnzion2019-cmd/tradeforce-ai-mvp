@@ -1,6 +1,8 @@
 """TradeForce AI application entrypoint with Phase 5 billing enabled."""
 import os
 import re
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +22,18 @@ ALLOWED_UPLOADS = {
     ".jpg": {"image/jpeg"},
     ".jpeg": {"image/jpeg"},
     ".png": {"image/png"},
+}
+
+# Lightweight per-instance rate limiting for the MVP. This protects high-risk
+# endpoints from basic abuse without introducing another paid dependency.
+_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+RATE_LIMITS = {
+    "login": (10, 300),       # 10 attempts / 5 minutes / client
+    "signup": (5, 3600),      # 5 account creations / hour / client
+    "message": (30, 60),      # 30 message writes / minute / client
+    "job": (20, 60),          # 20 job mutations / minute / client
+    "apply": (30, 60),        # 30 application writes / minute / client
+    "mutation": (120, 60),    # fallback for other state-changing requests
 }
 
 
@@ -102,6 +116,46 @@ def validate_worker_uploads(content_type: str, body: bytes) -> str | None:
     return None
 
 
+def _client_key(request: Request) -> str:
+    """Return a best-effort client identifier behind Render's reverse proxy."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()[:80]
+    return (request.client.host if request.client else "unknown")[:80]
+
+
+def _rate_class(request: Request) -> str:
+    path = request.url.path
+    if path == "/login":
+        return "login"
+    if path == "/signup":
+        return "signup"
+    if path.startswith("/messages") or path.startswith("/message"):
+        return "message"
+    if path.startswith("/contractor/job"):
+        return "job"
+    if path.startswith("/job/") and path.endswith("/apply"):
+        return "apply"
+    return "mutation"
+
+
+def _rate_limited(request: Request) -> tuple[bool, int]:
+    """Return (blocked, retry_after_seconds) for state-changing requests."""
+    rate_class = _rate_class(request)
+    limit, window = RATE_LIMITS[rate_class]
+    now = time.monotonic()
+    bucket_key = f"{rate_class}:{_client_key(request)}"
+    bucket = _RATE_BUCKETS[bucket_key]
+    cutoff = now - window
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        retry_after = max(1, int(window - (now - bucket[0])))
+        return True, retry_after
+    bucket.append(now)
+    return False, 0
+
+
 quarantine_legacy_unowned_jobs()
 app.include_router(billing_router)
 app.include_router(legal_router)
@@ -109,7 +163,7 @@ app.include_router(legal_router)
 
 @app.middleware("http")
 async def production_security(request: Request, call_next):
-    """Apply browser security controls and validate worker document uploads."""
+    """Apply browser security, abuse controls, and upload validation."""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/stripe/webhook":
         expected_host = urlparse(os.getenv("APP_BASE_URL", "")).netloc or request.url.netloc
         origin = request.headers.get("origin")
@@ -117,6 +171,14 @@ async def production_security(request: Request, call_next):
         source_host = urlparse(origin).netloc if origin else (urlparse(referer).netloc if referer else "")
         if source_host and source_host != expected_host:
             return PlainTextResponse("Cross-site request blocked.", status_code=403)
+
+        blocked, retry_after = _rate_limited(request)
+        if blocked:
+            return PlainTextResponse(
+                "Too many requests. Please try again shortly.",
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
 
     if request.method == "POST" and request.url.path == "/worker/profile":
         content_type = request.headers.get("content-type", "")
