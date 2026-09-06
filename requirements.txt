@@ -6,3 +6,4 @@ SQLAlchemy==2.0.36
 psycopg[binary]==3.3.5
 itsdangerous==2.2.0
 boto3==1.40.32
+stripe>=12.0,<15.0
