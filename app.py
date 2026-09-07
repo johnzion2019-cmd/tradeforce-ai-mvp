@@ -157,6 +157,43 @@ def _rate_limited(request: Request) -> tuple[bool, int]:
     return False, 0
 
 
+def _job_display(job_id: int) -> str:
+    """Return a readable company/trade label for worker application cards."""
+    db = main.SessionLocal()
+    try:
+        job = db.query(main.ManpowerRequest).filter(main.ManpowerRequest.id == job_id).first()
+        if job:
+            return f"{job.company} — {job.trade}"
+        return f"Job #{job_id}"
+    finally:
+        db.close()
+
+
+def _contractor_display(user_id: int) -> str:
+    """Return the contractor's company name, falling back to their latest job."""
+    db = main.SessionLocal()
+    try:
+        profile = db.query(main.CompanyProfile).filter(main.CompanyProfile.user_id == user_id).first()
+        if profile and profile.company_name.strip():
+            return profile.company_name.strip()
+        job = (
+            db.query(main.ManpowerRequest)
+            .filter(main.ManpowerRequest.user_id == user_id)
+            .order_by(main.ManpowerRequest.id.desc())
+            .first()
+        )
+        if job and job.company.strip():
+            return job.company.strip()
+        account = db.query(main.UserAccount).filter(main.UserAccount.id == user_id).first()
+        return account.email if account else "Contractor"
+    finally:
+        db.close()
+
+
+main.templates.env.globals["job_display"] = _job_display
+main.templates.env.globals["contractor_display"] = _contractor_display
+
+
 quarantine_legacy_unowned_jobs()
 app.include_router(billing_router)
 app.include_router(legal_router)
