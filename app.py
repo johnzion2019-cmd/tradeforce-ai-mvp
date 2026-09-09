@@ -1,4 +1,5 @@
 """TradeForce AI application entrypoint with Phase 5 billing enabled."""
+import html
 import os
 import re
 import time
@@ -7,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import main
-from account_security import router as account_security_router
+from account_security import _send_email, router as account_security_router
 from fastapi import Request
 from fastapi.responses import PlainTextResponse
 from legal_routes import router as legal_router
@@ -190,6 +191,45 @@ def _contractor_display(user_id: int) -> str:
         db.close()
 
 
+def _email_latest_manpower_request(user_id: int) -> None:
+    """Email the contractor a confirmation after a manpower request posts successfully."""
+    db = main.SessionLocal()
+    try:
+        account = db.query(main.UserAccount).filter(main.UserAccount.id == user_id).first()
+        job = (
+            db.query(main.ManpowerRequest)
+            .filter(main.ManpowerRequest.user_id == user_id)
+            .order_by(main.ManpowerRequest.id.desc())
+            .first()
+        )
+        if not account or not job:
+            return
+        dashboard_url = (os.getenv("APP_BASE_URL") or "https://tradeforce-ai.com").rstrip("/") + "/dashboard"
+        company = html.escape(job.company or "Your company")
+        trade = html.escape(job.trade or "Skilled trade")
+        location = html.escape(job.location or "Not specified")
+        pay_range = html.escape(job.pay_range or "Not specified")
+        start_date = html.escape(job.start_date or "Not specified")
+        duration = html.escape(job.duration or "Not specified")
+        notes = html.escape(job.notes or "None")
+        _send_email(
+            account.email,
+            f"Manpower request posted — {job.trade}",
+            (
+                "<h2>Your manpower request is live</h2>"
+                f"<p><strong>{company}</strong> has posted a request for <strong>{job.workers_needed} {trade}</strong> worker(s).</p>"
+                f"<p><strong>Location:</strong> {location}<br>"
+                f"<strong>Pay:</strong> {pay_range}<br>"
+                f"<strong>Start date:</strong> {start_date}<br>"
+                f"<strong>Duration:</strong> {duration}</p>"
+                f"<p><strong>Requirements / notes:</strong> {notes}</p>"
+                f"<p><a href=\"{html.escape(dashboard_url, quote=True)}\">View your TradeForce AI dashboard</a></p>"
+            ),
+        )
+    finally:
+        db.close()
+
+
 main.templates.env.globals["job_display"] = _job_display
 main.templates.env.globals["contractor_display"] = _contractor_display
 
@@ -202,7 +242,7 @@ app.include_router(account_security_router)
 
 @app.middleware("http")
 async def production_security(request: Request, call_next):
-    """Apply browser security, abuse controls, and upload validation."""
+    """Apply browser security, abuse controls, upload validation, and post-job email confirmation."""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/stripe/webhook":
         expected_host = urlparse(os.getenv("APP_BASE_URL", "")).netloc or request.url.netloc
         origin = request.headers.get("origin")
@@ -239,6 +279,16 @@ async def production_security(request: Request, call_next):
             request._receive = replay_receive
 
     response = await call_next(request)
+
+    if request.method == "POST" and request.url.path == "/contractor/job" and response.status_code in {302, 303}:
+        try:
+            user_id = request.session.get("user_id")
+            if user_id:
+                _email_latest_manpower_request(int(user_id))
+        except Exception:
+            # Email confirmation must never turn a successful job posting into an error.
+            pass
+
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
