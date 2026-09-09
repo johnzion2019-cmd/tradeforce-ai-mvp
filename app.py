@@ -191,6 +191,36 @@ def _contractor_display(user_id: int) -> str:
         db.close()
 
 
+def _company_public(user_id: int) -> dict | None:
+    """Return worker-safe company profile details for opportunity cards."""
+    if not user_id:
+        return None
+    db = main.SessionLocal()
+    try:
+        profile = db.query(main.CompanyProfile).filter(main.CompanyProfile.user_id == user_id).first()
+        if not profile:
+            return None
+        company_name = (profile.company_name or "").strip()
+        location = (profile.location or "").strip()
+        website = (profile.website or "").strip()
+        bio = (profile.bio or "").strip()
+        if not any((company_name, location, website, bio)):
+            return None
+        website_url = website
+        if website_url and not website_url.lower().startswith(("http://", "https://")):
+            website_url = "https://" + website_url
+        return {
+            "company_name": company_name or _contractor_display(user_id),
+            "location": location,
+            "website": website,
+            "website_url": website_url,
+            "bio": bio,
+            "verified": bool(profile.verified),
+        }
+    finally:
+        db.close()
+
+
 def _email_latest_manpower_request(user_id: int) -> None:
     """Email the contractor a confirmation after a manpower request posts successfully."""
     db = main.SessionLocal()
@@ -232,6 +262,7 @@ def _email_latest_manpower_request(user_id: int) -> None:
 
 main.templates.env.globals["job_display"] = _job_display
 main.templates.env.globals["contractor_display"] = _contractor_display
+main.templates.env.globals["company_public"] = _company_public
 
 
 quarantine_legacy_unowned_jobs()
