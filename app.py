@@ -326,3 +326,21 @@ async def production_security(request: Request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Strict-Transport-Security"] = "max-age=31536000"
     return response
+
+
+@app.post("/job/{job_id}/reopen")
+def reopen_job(job_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
+    """Reopen a contractor-owned closed manpower request without touching its history."""
+    user = main.require_user(request, db, "contractor")
+    job = (
+        db.query(main.ManpowerRequest)
+        .filter(main.ManpowerRequest.id == job_id, main.ManpowerRequest.user_id == user.id)
+        .first()
+    )
+    if not job:
+        raise main.HTTPException(status_code=404, detail="Job not found")
+    if job.status == "closed":
+        job.status = "open"
+        main.notify(db, user.id, "Manpower request reopened", f"Your {job.trade} request is open again.")
+        db.commit()
+    return main.RedirectResponse("/dashboard", status_code=303)
