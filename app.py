@@ -344,3 +344,77 @@ def reopen_job(job_id: int, request: main.Request, db: main.Session = main.Depen
         main.notify(db, user.id, "Manpower request reopened", f"Your {job.trade} request is open again.")
         db.commit()
     return main.RedirectResponse("/dashboard", status_code=303)
+
+
+@app.post("/application/{application_id}/offer/accept")
+def accept_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
+    """Allow the worker who owns an application to accept a contractor offer."""
+    user = main.require_user(request, db, "worker")
+    app_row = (
+        db.query(main.Application)
+        .filter(
+            main.Application.id == application_id,
+            main.Application.worker_user_id == user.id,
+        )
+        .first()
+    )
+    if not app_row:
+        raise main.HTTPException(status_code=404, detail="Application not found")
+    if app_row.status != "offered":
+        raise main.HTTPException(status_code=400, detail="This application does not have an active offer.")
+    app_row.status = "offer_accepted"
+    app_row.updated_at = main.now_iso()
+    job = main.job_for_application(db, app_row)
+    worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
+    worker_name = worker.name if worker else "Candidate"
+    main.notify(
+        db,
+        app_row.contractor_user_id,
+        "Offer accepted",
+        f"{worker_name} accepted your offer for {job.trade if job else 'the position'}. You can now mark the candidate as hired.",
+    )
+    main.notify(
+        db,
+        user.id,
+        "Offer accepted",
+        f"You accepted the offer from {job.company if job else 'the contractor'}.",
+    )
+    db.commit()
+    return main.RedirectResponse("/dashboard", status_code=303)
+
+
+@app.post("/application/{application_id}/offer/decline")
+def decline_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
+    """Allow the worker who owns an application to decline a contractor offer."""
+    user = main.require_user(request, db, "worker")
+    app_row = (
+        db.query(main.Application)
+        .filter(
+            main.Application.id == application_id,
+            main.Application.worker_user_id == user.id,
+        )
+        .first()
+    )
+    if not app_row:
+        raise main.HTTPException(status_code=404, detail="Application not found")
+    if app_row.status != "offered":
+        raise main.HTTPException(status_code=400, detail="This application does not have an active offer.")
+    app_row.status = "offer_declined"
+    app_row.updated_at = main.now_iso()
+    job = main.job_for_application(db, app_row)
+    worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
+    worker_name = worker.name if worker else "Candidate"
+    main.notify(
+        db,
+        app_row.contractor_user_id,
+        "Offer declined",
+        f"{worker_name} declined your offer for {job.trade if job else 'the position'}.",
+    )
+    main.notify(
+        db,
+        user.id,
+        "Offer declined",
+        f"You declined the offer from {job.company if job else 'the contractor'}.",
+    )
+    db.commit()
+    return main.RedirectResponse("/dashboard", status_code=303)
