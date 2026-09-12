@@ -1,4 +1,4 @@
-"""TradeForce AI application entrypoint with Phase 5 billing enabled."""
+"""TradeForce AI application entrypoint with Phase 6 hiring/onboarding enabled."""
 import html
 import os
 import re
@@ -14,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 from legal_routes import router as legal_router
 from main import app
 from phase5_billing import router as billing_router
+from phase6_onboarding import init_phase6, onboarding_progress, hire_for_application, router as phase6_router
 
 
 MAX_UPLOAD_REQUEST_BYTES = 12 * 1024 * 1024
@@ -263,12 +264,16 @@ def _email_latest_manpower_request(user_id: int) -> None:
 main.templates.env.globals["job_display"] = _job_display
 main.templates.env.globals["contractor_display"] = _contractor_display
 main.templates.env.globals["company_public"] = _company_public
+main.templates.env.globals["hire_for_application"] = hire_for_application
+main.templates.env.globals["onboarding_progress"] = onboarding_progress
 
 
 quarantine_legacy_unowned_jobs()
+init_phase6()
 app.include_router(billing_router)
 app.include_router(legal_router)
 app.include_router(account_security_router)
+app.include_router(phase6_router)
 
 
 @app.middleware("http")
