@@ -29,6 +29,11 @@ class HireRecord(main.Base):
     assignment_status = Column(String(40), default="ready_to_start")
     actual_start_date = Column(String(40), default="")
     completed_date = Column(String(40), default="")
+    supervisor = Column(String(160), default="")
+    site_contact = Column(String(160), default="")
+    expected_end_date = Column(String(40), default="")
+    assignment_notes = Column(Text, default="")
+    hours_worked = Column(String(40), default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -42,6 +47,11 @@ def init_phase6():
         "assignment_status": "VARCHAR(40) DEFAULT 'ready_to_start'",
         "actual_start_date": "VARCHAR(40) DEFAULT ''",
         "completed_date": "VARCHAR(40) DEFAULT ''",
+        "supervisor": "VARCHAR(160) DEFAULT ''",
+        "site_contact": "VARCHAR(160) DEFAULT ''",
+        "expected_end_date": "VARCHAR(40) DEFAULT ''",
+        "assignment_notes": "TEXT DEFAULT ''",
+        "hours_worked": "VARCHAR(40) DEFAULT ''",
     }
     with main.engine.begin() as conn:
         for name, sql_type in additions.items():
@@ -246,6 +256,38 @@ def update_onboarding(
         main.notify(db, app_row.worker_user_id, "Cleared to start", "Your contractor marked your onboarding as cleared to start.")
     else:
         main.notify(db, app_row.worker_user_id, "Onboarding updated", "Your contractor updated your onboarding checklist.")
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/active-details")
+def save_active_assignment_details(
+    application_id: int,
+    request: Request,
+    supervisor: str = Form(""),
+    site_contact: str = Form(""),
+    expected_end_date: str = Form(""),
+    assignment_notes: str = Form(""),
+    hours_worked: str = Form(""),
+    db: main.Session = Depends(main.get_db),
+):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(
+        main.Application.id == application_id,
+        main.Application.contractor_user_id == user.id,
+        main.Application.status == "hired",
+    ).first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Active assignment not found")
+    if hire.assignment_status != "active":
+        raise HTTPException(status_code=400, detail="Assignment management is available only while Active.")
+    hire.supervisor = supervisor.strip()[:160]
+    hire.site_contact = site_contact.strip()[:160]
+    hire.expected_end_date = expected_end_date.strip()[:40]
+    hire.assignment_notes = assignment_notes.strip()[:4000]
+    hire.hours_worked = hours_worked.strip()[:40]
+    hire.updated_at = main.now_iso()
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
