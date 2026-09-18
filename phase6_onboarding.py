@@ -47,6 +47,7 @@ class Timesheet(main.Base):
     overtime_hours = Column(String(40), default="0")
     notes = Column(Text, default="")
     status = Column(String(40), default="submitted")
+    contractor_notes = Column(Text, default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -56,6 +57,7 @@ def init_phase6():
     # create_all does not add new columns to an existing table, so keep this
     # small migration safe for both SQLite and Postgres deployments.
     existing = {c["name"] for c in inspect(main.engine).get_columns("hire_records")}
+    timesheet_existing = {c["name"] for c in inspect(main.engine).get_columns("timesheets")}
     additions = {
         "assignment_status": "VARCHAR(40) DEFAULT 'ready_to_start'",
         "actual_start_date": "VARCHAR(40) DEFAULT ''",
@@ -70,7 +72,9 @@ def init_phase6():
         for name, sql_type in additions.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE hire_records ADD COLUMN {name} {sql_type}"))
-        conn.execute(text("UPDATE hire_records SET assignment_status='ready_to_start' WHERE assignment_status IS NULL OR assignment_status=''"))
+        conn.execute(text("UPDATE hire_records SET assignment_status=\'ready_to_start\' WHERE assignment_status IS NULL OR assignment_status=\'\'"))
+        if "contractor_notes" not in timesheet_existing:
+            conn.execute(text("ALTER TABLE timesheets ADD COLUMN contractor_notes TEXT DEFAULT \'\'"))
 
 
 def _application(db, application_id: int):
@@ -167,6 +171,8 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
         "progress": _onboarding_progress(worker, hire),
         "details_complete": _details_complete(hire),
         "timesheets": db.query(Timesheet).filter(Timesheet.hire_id == hire.id).order_by(Timesheet.week_start.desc()).all() if hire else [],
+        "approved_regular": sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
+        "approved_overtime": sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
     })
 
 
@@ -288,7 +294,20 @@ def submit_timesheet(application_id: int, request: Request, week_start: str = Fo
         raise HTTPException(status_code=400, detail="Hours must be valid numbers.")
     if regular < 0 or overtime < 0 or regular + overtime > 168:
         raise HTTPException(status_code=400, detail="Weekly hours must be between 0 and 168.")
-    row = Timesheet(hire_id=hire.id, week_start=week_start.strip()[:40], regular_hours=str(regular), overtime_hours=str(overtime), notes=notes.strip()[:2000], status="submitted")
+    week = week_start.strip()[:40]
+    existing_sheet = db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.week_start == week).first()
+    if existing_sheet and existing_sheet.status != "rejected":
+        raise HTTPException(status_code=400, detail="A timesheet already exists for this week.")
+    if existing_sheet:
+        row = existing_sheet
+        row.regular_hours = str(regular)
+        row.overtime_hours = str(overtime)
+        row.notes = notes.strip()[:2000]
+        row.status = "submitted"
+        row.contractor_notes = ""
+        row.updated_at = main.now_iso()
+    else:
+        row = Timesheet(hire_id=hire.id, week_start=week, regular_hours=str(regular), overtime_hours=str(overtime), notes=notes.strip()[:2000], status="submitted")
     db.add(row)
     main.notify(db, app_row.contractor_user_id, "Timesheet submitted", "A weekly timesheet is ready for review.")
     db.commit()
@@ -296,7 +315,7 @@ def submit_timesheet(application_id: int, request: Request, week_start: str = Fo
 
 
 @router.post("/hire/{application_id}/timesheet/{timesheet_id}")
-def review_timesheet(application_id: int, timesheet_id: int, request: Request, action: str = Form(...), db: main.Session = Depends(main.get_db)):
+def review_timesheet(application_id: int, timesheet_id: int, request: Request, action: str = Form(...), contractor_notes: str = Form(""), db: main.Session = Depends(main.get_db)):
     user = main.require_user(request, db, "contractor")
     app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id, main.Application.status == "hired").first()
     hire = _hire(db, application_id)
@@ -307,7 +326,10 @@ def review_timesheet(application_id: int, timesheet_id: int, request: Request, a
         raise HTTPException(status_code=404, detail="Timesheet not found")
     if action not in {"approve", "reject"}:
         raise HTTPException(status_code=400, detail="Unknown timesheet action")
+    if row.status != "submitted":
+        raise HTTPException(status_code=400, detail="Only submitted timesheets can be reviewed.")
     row.status = "approved" if action == "approve" else "rejected"
+    row.contractor_notes = contractor_notes.strip()[:2000]
     row.updated_at = main.now_iso()
     main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.")
     db.commit()
