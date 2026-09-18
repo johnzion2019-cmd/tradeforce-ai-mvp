@@ -38,6 +38,19 @@ class HireRecord(main.Base):
     updated_at = Column(String(40), default=main.now_iso)
 
 
+class Timesheet(main.Base):
+    __tablename__ = "timesheets"
+    id = Column(Integer, primary_key=True)
+    hire_id = Column(Integer, ForeignKey("hire_records.id"), nullable=False, index=True)
+    week_start = Column(String(40), nullable=False)
+    regular_hours = Column(String(40), default="0")
+    overtime_hours = Column(String(40), default="0")
+    notes = Column(Text, default="")
+    status = Column(String(40), default="submitted")
+    created_at = Column(String(40), default=main.now_iso)
+    updated_at = Column(String(40), default=main.now_iso)
+
+
 def init_phase6():
     main.Base.metadata.create_all(bind=main.engine)
     # create_all does not add new columns to an existing table, so keep this
@@ -153,6 +166,7 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
         "hire": hire,
         "progress": _onboarding_progress(worker, hire),
         "details_complete": _details_complete(hire),
+        "timesheets": db.query(Timesheet).filter(Timesheet.hire_id == hire.id).order_by(Timesheet.week_start.desc()).all() if hire else [],
     })
 
 
@@ -256,6 +270,46 @@ def update_onboarding(
         main.notify(db, app_row.worker_user_id, "Cleared to start", "Your contractor marked your onboarding as cleared to start.")
     else:
         main.notify(db, app_row.worker_user_id, "Onboarding updated", "Your contractor updated your onboarding checklist.")
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/timesheet")
+def submit_timesheet(application_id: int, request: Request, week_start: str = Form(...), regular_hours: str = Form("0"), overtime_hours: str = Form("0"), notes: str = Form(""), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "worker")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.worker_user_id == user.id, main.Application.status == "hired").first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire or hire.assignment_status != "active":
+        raise HTTPException(status_code=404, detail="Active assignment not found")
+    try:
+        regular = float(regular_hours or 0)
+        overtime = float(overtime_hours or 0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Hours must be valid numbers.")
+    if regular < 0 or overtime < 0 or regular + overtime > 168:
+        raise HTTPException(status_code=400, detail="Weekly hours must be between 0 and 168.")
+    row = Timesheet(hire_id=hire.id, week_start=week_start.strip()[:40], regular_hours=str(regular), overtime_hours=str(overtime), notes=notes.strip()[:2000], status="submitted")
+    db.add(row)
+    main.notify(db, app_row.contractor_user_id, "Timesheet submitted", "A weekly timesheet is ready for review.")
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/timesheet/{timesheet_id}")
+def review_timesheet(application_id: int, timesheet_id: int, request: Request, action: str = Form(...), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id, main.Application.status == "hired").first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Timesheet not found")
+    row = db.query(Timesheet).filter(Timesheet.id == timesheet_id, Timesheet.hire_id == hire.id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Timesheet not found")
+    if action not in {"approve", "reject"}:
+        raise HTTPException(status_code=400, detail="Unknown timesheet action")
+    row.status = "approved" if action == "approve" else "rejected"
+    row.updated_at = main.now_iso()
+    main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.")
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
