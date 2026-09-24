@@ -34,6 +34,9 @@ class HireRecord(main.Base):
     expected_end_date = Column(String(40), default="")
     assignment_notes = Column(Text, default="")
     hours_worked = Column(String(40), default="")
+    worker_hourly_rate = Column(String(40), default="")
+    overtime_multiplier = Column(String(40), default="1.5")
+    contractor_bill_rate = Column(String(40), default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -67,6 +70,9 @@ def init_phase6():
         "expected_end_date": "VARCHAR(40) DEFAULT ''",
         "assignment_notes": "TEXT DEFAULT ''",
         "hours_worked": "VARCHAR(40) DEFAULT ''",
+        "worker_hourly_rate": "VARCHAR(40) DEFAULT ''",
+        "overtime_multiplier": "VARCHAR(40) DEFAULT '1.5'",
+        "contractor_bill_rate": "VARCHAR(40) DEFAULT ''",
     }
     with main.engine.begin() as conn:
         for name, sql_type in additions.items():
@@ -173,6 +179,8 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
         "timesheets": db.query(Timesheet).filter(Timesheet.hire_id == hire.id).order_by(Timesheet.week_start.desc()).all() if hire else [],
         "approved_regular": sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
         "approved_overtime": sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
+        "worker_pay_estimate": ((sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.worker_hourly_rate or 0)) + (sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.worker_hourly_rate or 0) * float(hire.overtime_multiplier or 1.5))) if hire else 0,
+        "contractor_bill_estimate": ((sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) + sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.overtime_multiplier or 1.5)) * float(hire.contractor_bill_rate or 0)) if hire else 0,
     })
 
 
@@ -332,6 +340,29 @@ def review_timesheet(application_id: int, timesheet_id: int, request: Request, a
     row.contractor_notes = contractor_notes.strip()[:2000]
     row.updated_at = main.now_iso()
     main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.")
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/billing-rates")
+def save_billing_rates(application_id: int, request: Request, worker_hourly_rate: str = Form(""), overtime_multiplier: str = Form("1.5"), contractor_bill_rate: str = Form(""), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id, main.Application.status == "hired").first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    try:
+        worker_rate = float(worker_hourly_rate or 0)
+        ot_multiplier = float(overtime_multiplier or 1.5)
+        bill_rate = float(contractor_bill_rate or 0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Rates must be valid numbers.")
+    if worker_rate < 0 or bill_rate < 0 or ot_multiplier < 1 or ot_multiplier > 3:
+        raise HTTPException(status_code=400, detail="Enter valid rates and an OT multiplier from 1 to 3.")
+    hire.worker_hourly_rate = str(worker_rate)
+    hire.overtime_multiplier = str(ot_multiplier)
+    hire.contractor_bill_rate = str(bill_rate)
+    hire.updated_at = main.now_iso()
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
