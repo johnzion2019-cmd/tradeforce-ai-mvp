@@ -41,6 +41,20 @@ class HireRecord(main.Base):
     updated_at = Column(String(40), default=main.now_iso)
 
 
+class PayrollInvoiceRecord(main.Base):
+    __tablename__ = "payroll_invoice_records"
+    id = Column(Integer, primary_key=True)
+    hire_id = Column(Integer, ForeignKey("hire_records.id"), nullable=False, index=True)
+    regular_hours = Column(String(40), default="0")
+    overtime_hours = Column(String(40), default="0")
+    worker_gross_pay = Column(String(40), default="0")
+    contractor_billing = Column(String(40), default="0")
+    payroll_status = Column(String(40), default="pending")
+    invoice_status = Column(String(40), default="pending")
+    created_at = Column(String(40), default=main.now_iso)
+    updated_at = Column(String(40), default=main.now_iso)
+
+
 class Timesheet(main.Base):
     __tablename__ = "timesheets"
     id = Column(Integer, primary_key=True)
@@ -51,6 +65,7 @@ class Timesheet(main.Base):
     notes = Column(Text, default="")
     status = Column(String(40), default="submitted")
     contractor_notes = Column(Text, default="")
+    payroll_invoice_id = Column(Integer, ForeignKey("payroll_invoice_records.id"), nullable=True, index=True)
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -80,7 +95,9 @@ def init_phase6():
                 conn.execute(text(f"ALTER TABLE hire_records ADD COLUMN {name} {sql_type}"))
         conn.execute(text("UPDATE hire_records SET assignment_status=\'ready_to_start\' WHERE assignment_status IS NULL OR assignment_status=\'\'"))
         if "contractor_notes" not in timesheet_existing:
-            conn.execute(text("ALTER TABLE timesheets ADD COLUMN contractor_notes TEXT DEFAULT \'\'"))
+            conn.execute(text("ALTER TABLE timesheets ADD COLUMN contractor_notes TEXT DEFAULT ''"))
+        if "payroll_invoice_id" not in timesheet_existing:
+            conn.execute(text("ALTER TABLE timesheets ADD COLUMN payroll_invoice_id INTEGER"))
 
 
 def _application(db, application_id: int):
@@ -180,6 +197,8 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
         "approved_regular": sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
         "approved_overtime": sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
         "worker_pay_estimate": ((sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.worker_hourly_rate or 0)) + (sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.worker_hourly_rate or 0) * float(hire.overtime_multiplier or 1.5))) if hire else 0,
+        "payroll_records": db.query(PayrollInvoiceRecord).filter(PayrollInvoiceRecord.hire_id == hire.id).order_by(PayrollInvoiceRecord.id.desc()).all() if hire else [],
+        "unbilled_approved_count": db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved", Timesheet.payroll_invoice_id.is_(None)).count() if hire else 0,
         "contractor_bill_estimate": ((sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) + sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) * float(hire.overtime_multiplier or 1.5)) * float(hire.contractor_bill_rate or 0)) if hire else 0,
     })
 
@@ -363,6 +382,61 @@ def save_billing_rates(application_id: int, request: Request, worker_hourly_rate
     hire.overtime_multiplier = str(ot_multiplier)
     hire.contractor_bill_rate = str(bill_rate)
     hire.updated_at = main.now_iso()
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/payroll-invoice")
+def create_payroll_invoice(application_id: int, request: Request, db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id, main.Application.status == "hired").first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    sheets = db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved", Timesheet.payroll_invoice_id.is_(None)).all()
+    if not sheets:
+        raise HTTPException(status_code=400, detail="No new approved timesheets are available.")
+    try:
+        worker_rate = float(hire.worker_hourly_rate or 0)
+        multiplier = float(hire.overtime_multiplier or 1.5)
+        bill_rate = float(hire.contractor_bill_rate or 0)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Save valid payroll and billing rates first.")
+    if worker_rate <= 0 or bill_rate <= 0:
+        raise HTTPException(status_code=400, detail="Save worker and contractor rates before creating records.")
+    regular = sum(float(s.regular_hours or 0) for s in sheets)
+    overtime = sum(float(s.overtime_hours or 0) for s in sheets)
+    record = PayrollInvoiceRecord(hire_id=hire.id, regular_hours=str(regular), overtime_hours=str(overtime), worker_gross_pay=str(regular * worker_rate + overtime * worker_rate * multiplier), contractor_billing=str((regular + overtime * multiplier) * bill_rate))
+    db.add(record)
+    db.flush()
+    for sheet in sheets:
+        sheet.payroll_invoice_id = record.id
+        sheet.updated_at = main.now_iso()
+    db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/payroll-invoice/{record_id}")
+def update_payroll_invoice(application_id: int, record_id: int, request: Request, action: str = Form(...), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id).first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Record not found")
+    record = db.query(PayrollInvoiceRecord).filter(PayrollInvoiceRecord.id == record_id, PayrollInvoiceRecord.hire_id == hire.id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    if action == "process_payroll":
+        record.payroll_status = "processed"
+    elif action == "pay_payroll":
+        record.payroll_status = "paid"
+    elif action == "send_invoice":
+        record.invoice_status = "processed"
+    elif action == "pay_invoice":
+        record.invoice_status = "paid"
+    else:
+        raise HTTPException(status_code=400, detail="Unknown record action")
+    record.updated_at = main.now_iso()
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
