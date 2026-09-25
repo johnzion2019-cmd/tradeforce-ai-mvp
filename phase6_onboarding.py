@@ -37,6 +37,13 @@ class HireRecord(main.Base):
     worker_hourly_rate = Column(String(40), default="")
     overtime_multiplier = Column(String(40), default="1.5")
     contractor_bill_rate = Column(String(40), default="")
+    completion_reason = Column(String(160), default="")
+    completion_notes = Column(Text, default="")
+    contractor_rating = Column(Integer, nullable=True)
+    contractor_review = Column(Text, default="")
+    rehire_eligible = Column(Boolean, default=False)
+    worker_rating = Column(Integer, nullable=True)
+    worker_review = Column(Text, default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -88,6 +95,13 @@ def init_phase6():
         "worker_hourly_rate": "VARCHAR(40) DEFAULT ''",
         "overtime_multiplier": "VARCHAR(40) DEFAULT '1.5'",
         "contractor_bill_rate": "VARCHAR(40) DEFAULT ''",
+        "completion_reason": "VARCHAR(160)",
+        "completion_notes": "TEXT",
+        "contractor_rating": "INTEGER",
+        "contractor_review": "TEXT",
+        "rehire_eligible": "BOOLEAN",
+        "worker_rating": "INTEGER",
+        "worker_review": "TEXT",
     }
     with main.engine.begin() as conn:
         for name, sql_type in additions.items():
@@ -534,6 +548,10 @@ def update_assignment(
     elif action == "complete":
         if hire.assignment_status != "active":
             raise HTTPException(status_code=400, detail="Only an active assignment can be completed.")
+        open_sheets = db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "submitted").count()
+        unprocessed_sheets = db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved", Timesheet.payroll_invoice_id.is_(None)).count()
+        if open_sheets or unprocessed_sheets:
+            raise HTTPException(status_code=400, detail="Review and process all timesheets before completing the assignment.")
         hire.assignment_status = "completed"
         hire.completed_date = main.now_iso()[:10]
         main.notify(db, app_row.worker_user_id, "Assignment completed", "Your contractor marked your assignment as completed.")
@@ -542,4 +560,23 @@ def update_assignment(
 
     hire.updated_at = main.now_iso()
     db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/completion-review")
+def save_completion_review(application_id: int, request: Request, completion_reason: str = Form(""), completion_notes: str = Form(""), contractor_rating: int = Form(...), contractor_review: str = Form(""), rehire_eligible: str = Form("no"), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id).first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire or hire.assignment_status != "completed": raise HTTPException(status_code=404, detail="Completed assignment not found")
+    if contractor_rating < 1 or contractor_rating > 5: raise HTTPException(status_code=400, detail="Rating must be from 1 to 5.")
+    hire.completion_reason = completion_reason.strip()[:160]; hire.completion_notes = completion_notes.strip()[:4000]; hire.contractor_rating = contractor_rating; hire.contractor_review = contractor_review.strip()[:4000]; hire.rehire_eligible = rehire_eligible == "yes"; hire.updated_at = main.now_iso(); db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+@router.post("/hire/{application_id}/worker-review")
+def save_worker_review(application_id: int, request: Request, worker_rating: int = Form(...), worker_review: str = Form(""), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "worker"); app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.worker_user_id == user.id).first(); hire = _hire(db, application_id)
+    if not app_row or not hire or hire.assignment_status != "completed": raise HTTPException(status_code=404, detail="Completed assignment not found")
+    if worker_rating < 1 or worker_rating > 5: raise HTTPException(status_code=400, detail="Rating must be from 1 to 5.")
+    hire.worker_rating = worker_rating; hire.worker_review = worker_review.strip()[:4000]; hire.updated_at = main.now_iso(); db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
