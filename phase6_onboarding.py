@@ -124,6 +124,9 @@ def init_phase6():
         for name, sql_type in payroll_additions.items():
             if name not in payroll_existing:
                 conn.execute(text(f"ALTER TABLE payroll_invoice_records ADD COLUMN {name} {sql_type}"))
+        # Backfill legacy paid records using their last recorded update date.
+        conn.execute(text("UPDATE payroll_invoice_records SET payroll_paid_date=SUBSTRING(updated_at,1,10) WHERE payroll_status=\'paid\' AND (payroll_paid_date IS NULL OR payroll_paid_date=\'\') AND updated_at IS NOT NULL"))
+        conn.execute(text("UPDATE payroll_invoice_records SET invoice_paid_date=SUBSTRING(updated_at,1,10) WHERE invoice_status=\'paid\' AND (invoice_paid_date IS NULL OR invoice_paid_date=\'\') AND updated_at IS NOT NULL"))
 
 
 def _application(db, application_id: int):
