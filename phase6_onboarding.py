@@ -58,6 +58,13 @@ class PayrollInvoiceRecord(main.Base):
     contractor_billing = Column(String(40), default="0")
     payroll_status = Column(String(40), default="pending")
     invoice_status = Column(String(40), default="pending")
+    invoice_number = Column(String(80), default="")
+    payroll_batch_number = Column(String(80), default="")
+    period_start = Column(String(40), default="")
+    period_end = Column(String(40), default="")
+    invoice_due_date = Column(String(40), default="")
+    payroll_paid_date = Column(String(40), default="")
+    invoice_paid_date = Column(String(40), default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -83,6 +90,7 @@ def init_phase6():
     # small migration safe for both SQLite and Postgres deployments.
     existing = {c["name"] for c in inspect(main.engine).get_columns("hire_records")}
     timesheet_existing = {c["name"] for c in inspect(main.engine).get_columns("timesheets")}
+    payroll_existing = {c["name"] for c in inspect(main.engine).get_columns("payroll_invoice_records")}
     additions = {
         "assignment_status": "VARCHAR(40) DEFAULT 'ready_to_start'",
         "actual_start_date": "VARCHAR(40) DEFAULT ''",
@@ -112,6 +120,10 @@ def init_phase6():
             conn.execute(text("ALTER TABLE timesheets ADD COLUMN contractor_notes TEXT DEFAULT ''"))
         if "payroll_invoice_id" not in timesheet_existing:
             conn.execute(text("ALTER TABLE timesheets ADD COLUMN payroll_invoice_id INTEGER"))
+        payroll_additions = {"invoice_number": "VARCHAR(80)", "payroll_batch_number": "VARCHAR(80)", "period_start": "VARCHAR(40)", "period_end": "VARCHAR(40)", "invoice_due_date": "VARCHAR(40)", "payroll_paid_date": "VARCHAR(40)", "invoice_paid_date": "VARCHAR(40)"}
+        for name, sql_type in payroll_additions.items():
+            if name not in payroll_existing:
+                conn.execute(text(f"ALTER TABLE payroll_invoice_records ADD COLUMN {name} {sql_type}"))
 
 
 def _application(db, application_id: int):
@@ -448,7 +460,8 @@ def create_payroll_invoice(application_id: int, request: Request, db: main.Sessi
         raise HTTPException(status_code=400, detail="Save worker and contractor rates before creating records.")
     regular = sum(float(s.regular_hours or 0) for s in sheets)
     overtime = sum(float(s.overtime_hours or 0) for s in sheets)
-    record = PayrollInvoiceRecord(hire_id=hire.id, regular_hours=str(regular), overtime_hours=str(overtime), worker_gross_pay=str(regular * worker_rate + overtime * worker_rate * multiplier), contractor_billing=str((regular + overtime * multiplier) * bill_rate))
+    weeks = sorted(s.week_start for s in sheets)
+    record = PayrollInvoiceRecord(hire_id=hire.id, regular_hours=str(regular), overtime_hours=str(overtime), worker_gross_pay=str(regular * worker_rate + overtime * worker_rate * multiplier), contractor_billing=str((regular + overtime * multiplier) * bill_rate), period_start=weeks[0] if weeks else "", period_end=weeks[-1] if weeks else "")
     db.add(record)
     db.flush()
     for sheet in sheets:
@@ -479,8 +492,20 @@ def update_payroll_invoice(application_id: int, record_id: int, request: Request
     else:
         raise HTTPException(status_code=400, detail="Unknown record action")
     record.updated_at = main.now_iso()
+    if action == "pay_payroll": record.payroll_paid_date = main.now_iso()[:10]
+    if action == "pay_invoice": record.invoice_paid_date = main.now_iso()[:10]
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/payroll-invoice/{record_id}/operations")
+def save_record_operations(application_id: int, record_id: int, request: Request, invoice_number: str = Form(""), payroll_batch_number: str = Form(""), period_start: str = Form(""), period_end: str = Form(""), invoice_due_date: str = Form(""), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor"); hire = _hire(db, application_id)
+    if not hire or hire.contractor_user_id != user.id: raise HTTPException(status_code=404, detail="Record not found")
+    record = db.query(PayrollInvoiceRecord).filter(PayrollInvoiceRecord.id == record_id, PayrollInvoiceRecord.hire_id == hire.id).first()
+    if not record: raise HTTPException(status_code=404, detail="Record not found")
+    record.invoice_number = invoice_number.strip()[:80]; record.payroll_batch_number = payroll_batch_number.strip()[:80]; record.period_start = period_start.strip()[:40]; record.period_end = period_end.strip()[:40]; record.invoice_due_date = invoice_due_date.strip()[:40]; record.updated_at = main.now_iso(); db.commit()
+    return RedirectResponse("/payroll-history", status_code=303)
 
 
 @router.post("/hire/{application_id}/active-details")
