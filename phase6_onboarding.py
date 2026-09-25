@@ -173,6 +173,34 @@ def hires_page(request: Request, db: main.Session = Depends(main.get_db)):
     return main.templates.TemplateResponse("hires.html", {"request": request, "user": user, "rows": rows})
 
 
+@router.get("/payroll-history", response_class=HTMLResponse)
+def payroll_history_page(request: Request, db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    records = (
+        db.query(PayrollInvoiceRecord, HireRecord, main.Worker, main.ManpowerRequest)
+        .join(HireRecord, PayrollInvoiceRecord.hire_id == HireRecord.id)
+        .join(main.Worker, HireRecord.worker_id == main.Worker.id)
+        .join(main.ManpowerRequest, HireRecord.job_id == main.ManpowerRequest.id)
+        .filter(HireRecord.contractor_user_id == user.id)
+        .order_by(PayrollInvoiceRecord.id.desc())
+        .all()
+    )
+    rows = []
+    for record, hire, worker, job in records:
+        rows.append({"record": record, "hire": hire, "worker": worker, "job": job})
+    total_billing = sum(float(r.contractor_billing or 0) for r, _, _, _ in records)
+    paid_billing = sum(float(r.contractor_billing or 0) for r, _, _, _ in records if r.invoice_status == "paid")
+    outstanding_billing = total_billing - paid_billing
+    total_payroll = sum(float(r.worker_gross_pay or 0) for r, _, _, _ in records)
+    paid_payroll = sum(float(r.worker_gross_pay or 0) for r, _, _, _ in records if r.payroll_status == "paid")
+    return main.templates.TemplateResponse("payroll_history.html", {
+        "request": request, "user": user, "rows": rows,
+        "total_billing": total_billing, "paid_billing": paid_billing,
+        "outstanding_billing": outstanding_billing, "total_payroll": total_payroll,
+        "paid_payroll": paid_payroll, "outstanding_payroll": total_payroll - paid_payroll,
+    })
+
+
 @router.get("/hire/{application_id}", response_class=HTMLResponse)
 def hire_detail_page(application_id: int, request: Request, db: main.Session = Depends(main.get_db)):
     user = main.require_user(request, db)
