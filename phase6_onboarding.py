@@ -44,6 +44,10 @@ class HireRecord(main.Base):
     rehire_eligible = Column(Boolean, default=False)
     worker_rating = Column(Integer, nullable=True)
     worker_review = Column(Text, default="")
+    compliance_status = Column(String(40), default="pending")
+    certification_expiration = Column(String(40), default="")
+    compliance_notes = Column(Text, default="")
+    compliance_verified_date = Column(String(40), default="")
     created_at = Column(String(40), default=main.now_iso)
     updated_at = Column(String(40), default=main.now_iso)
 
@@ -110,6 +114,10 @@ def init_phase6():
         "rehire_eligible": "BOOLEAN",
         "worker_rating": "INTEGER",
         "worker_review": "TEXT",
+        "compliance_status": "VARCHAR(40)",
+        "certification_expiration": "VARCHAR(40)",
+        "compliance_notes": "TEXT",
+        "compliance_verified_date": "VARCHAR(40)",
     }
     with main.engine.begin() as conn:
         for name, sql_type in additions.items():
@@ -607,4 +615,23 @@ def save_worker_review(application_id: int, request: Request, worker_rating: int
     if not app_row or not hire or hire.assignment_status != "completed": raise HTTPException(status_code=404, detail="Completed assignment not found")
     if worker_rating < 1 or worker_rating > 5: raise HTTPException(status_code=400, detail="Rating must be from 1 to 5.")
     hire.worker_rating = worker_rating; hire.worker_review = worker_review.strip()[:4000]; hire.updated_at = main.now_iso(); db.commit()
+    return RedirectResponse(f"/hire/{application_id}", status_code=303)
+
+
+@router.post("/hire/{application_id}/compliance")
+def save_compliance(application_id: int, request: Request, compliance_status: str = Form("pending"), certification_expiration: str = Form(""), compliance_notes: str = Form(""), db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    app_row = db.query(main.Application).filter(main.Application.id == application_id, main.Application.contractor_user_id == user.id).first()
+    hire = _hire(db, application_id)
+    if not app_row or not hire:
+        raise HTTPException(status_code=404, detail="Hire not found")
+    if compliance_status not in {"pending", "verified", "expired", "action_required"}:
+        raise HTTPException(status_code=400, detail="Invalid compliance status")
+    hire.compliance_status = compliance_status
+    hire.certification_expiration = certification_expiration.strip()[:40]
+    hire.compliance_notes = compliance_notes.strip()[:4000]
+    hire.compliance_verified_date = main.now_iso()[:10] if compliance_status == "verified" else ""
+    hire.updated_at = main.now_iso()
+    main.notify(db, app_row.worker_user_id, "Compliance status updated", "Your assignment compliance status was updated.")
+    db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
