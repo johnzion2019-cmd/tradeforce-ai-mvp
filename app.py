@@ -423,3 +423,39 @@ def decline_offer(application_id: int, request: main.Request, db: main.Session =
     )
     db.commit()
     return main.RedirectResponse("/dashboard", status_code=303)
+
+@app.get("/admin/operations", response_class=main.HTMLResponse)
+def admin_operations(request: main.Request, db: main.Session = main.Depends(main.get_db), admin: str = main.Depends(main.require_admin)):
+    """Phase 11 system-wide operations dashboard protected by admin credentials."""
+    from phase6_onboarding import HireRecord, PayrollInvoiceRecord
+    users = db.query(main.UserAccount).all()
+    hires = db.query(HireRecord).order_by(HireRecord.id.desc()).all()
+    records = db.query(PayrollInvoiceRecord).all()
+    workers = {w.id: w for w in db.query(main.Worker).all()}
+    jobs = {j.id: j for j in db.query(main.ManpowerRequest).all()}
+    def money(v):
+        try: return float(v or 0)
+        except (TypeError, ValueError): return 0.0
+    worker_gross = sum(money(r.worker_gross_pay) for r in records)
+    billing = sum(money(r.contractor_billing) for r in records)
+    payroll_outstanding = sum(money(r.worker_gross_pay) for r in records if r.payroll_status != "paid")
+    invoice_outstanding = sum(money(r.contractor_billing) for r in records if r.invoice_status != "paid")
+    attention_statuses = {"expired", "action_required", "pending"}
+    stats = {
+        "workers": sum(1 for u in users if u.role == "worker"),
+        "contractors": sum(1 for u in users if u.role == "contractor"),
+        "open_jobs": db.query(main.ManpowerRequest).filter(main.ManpowerRequest.status == "open").count(),
+        "applications": db.query(main.Application).count(),
+        "active": sum(1 for h in hires if h.assignment_status == "active"),
+        "completed": sum(1 for h in hires if h.assignment_status == "completed"),
+        "compliance_verified": sum(1 for h in hires if h.compliance_status == "verified"),
+        "compliance_attention": sum(1 for h in hires if (h.compliance_status or "pending") in attention_statuses),
+        "worker_gross": worker_gross, "billing": billing,
+        "payroll_outstanding": payroll_outstanding, "invoice_outstanding": invoice_outstanding,
+    }
+    def row(h):
+        w = workers.get(h.worker_id); j = jobs.get(h.job_id)
+        return {"application_id": h.application_id, "worker_name": w.name if w else f"Worker #{h.worker_id}", "trade": j.trade if j else (w.trade if w else "Trade"), "company": j.company if j else "Contractor", "location": h.job_location, "assignment_status": h.assignment_status or "unknown", "compliance_status": h.compliance_status or "pending", "status": h.compliance_status or "pending", "expiration": h.certification_expiration, "updated_at": h.updated_at or ""}
+    recent_hires = [row(h) for h in hires[:20]]
+    compliance_queue = [row(h) for h in hires if (h.compliance_status or "pending") in attention_statuses][:20]
+    return main.templates.TemplateResponse("admin_operations.html", {"request": request, "stats": stats, "recent_hires": recent_hires, "compliance_queue": compliance_queue})
