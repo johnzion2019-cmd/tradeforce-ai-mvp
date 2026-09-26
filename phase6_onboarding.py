@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, inspect, text
+from datetime import date, datetime
 
 import main
 
@@ -249,6 +250,18 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
     job = db.query(main.ManpowerRequest).filter(main.ManpowerRequest.id == app_row.job_id).first()
     worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
     hire = _hire(db, application_id)
+    compliance_alert = ""
+    compliance_days_remaining = None
+    if hire and hire.certification_expiration:
+        try:
+            expiry = datetime.strptime(hire.certification_expiration, "%Y-%m-%d").date()
+            compliance_days_remaining = (expiry - date.today()).days
+            if compliance_days_remaining < 0:
+                compliance_alert = "expired"
+            elif compliance_days_remaining <= 30:
+                compliance_alert = "expires_soon"
+        except ValueError:
+            compliance_alert = "invalid_date"
     return main.templates.TemplateResponse("hire_detail.html", {
         "request": request,
         "user": user,
@@ -258,6 +271,8 @@ def hire_detail_page(application_id: int, request: Request, db: main.Session = D
         "hire": hire,
         "progress": _onboarding_progress(worker, hire),
         "details_complete": _details_complete(hire),
+        "compliance_alert": compliance_alert,
+        "compliance_days_remaining": compliance_days_remaining,
         "timesheets": db.query(Timesheet).filter(Timesheet.hire_id == hire.id).order_by(Timesheet.week_start.desc()).all() if hire else [],
         "approved_regular": sum(float(t.regular_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
         "approved_overtime": sum(float(t.overtime_hours or 0) for t in db.query(Timesheet).filter(Timesheet.hire_id == hire.id, Timesheet.status == "approved").all()) if hire else 0,
