@@ -424,6 +424,20 @@ def decline_offer(application_id: int, request: main.Request, db: main.Session =
     db.commit()
     return main.RedirectResponse("/dashboard", status_code=303)
 
+@app.get("/notifications", response_class=main.HTMLResponse)
+def notifications_page(request: main.Request, db: main.Session = main.Depends(main.get_db)):
+    user = main.require_user(request, db)
+    items = db.query(main.Notification).filter(main.Notification.user_id == user.id).order_by(main.Notification.id.desc()).limit(100).all()
+    unread_count = sum(1 for item in items if not item.is_read)
+    return main.templates.TemplateResponse("notifications.html", {"request": request, "user": user, "notifications": items, "unread_count": unread_count})
+
+@app.post("/notifications/read-all")
+def notifications_read_all(request: main.Request, db: main.Session = main.Depends(main.get_db)):
+    user = main.require_user(request, db)
+    db.query(main.Notification).filter(main.Notification.user_id == user.id, main.Notification.is_read.is_(False)).update({main.Notification.is_read: True})
+    db.commit()
+    return main.RedirectResponse("/notifications", status_code=303)
+
 @app.get("/admin/operations", response_class=main.HTMLResponse)
 def admin_operations(request: main.Request, db: main.Session = main.Depends(main.get_db), admin: str = main.Depends(main.require_admin)):
     """Phase 11 system-wide operations dashboard protected by admin credentials."""
