@@ -1,6 +1,6 @@
 """Phase 6: hire details, onboarding checklist, and post-hire assignment lifecycle."""
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, inspect, text
 from datetime import date, datetime
 
@@ -237,6 +237,40 @@ def payroll_history_page(request: Request, db: main.Session = Depends(main.get_d
         "outstanding_billing": outstanding_billing, "total_payroll": total_payroll,
         "paid_payroll": paid_payroll, "outstanding_payroll": total_payroll - paid_payroll,
     })
+
+
+def _csv_cell(value):
+    text_value = str(value if value is not None else "")
+    return '"' + text_value.replace('"', '""') + '"'
+
+
+@router.get("/payroll-history/export.csv")
+def export_payroll_history_csv(request: Request, db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db, "contractor")
+    records = (db.query(PayrollInvoiceRecord, HireRecord, main.Worker, main.ManpowerRequest)
+        .join(HireRecord, PayrollInvoiceRecord.hire_id == HireRecord.id)
+        .join(main.Worker, HireRecord.worker_id == main.Worker.id)
+        .join(main.ManpowerRequest, HireRecord.job_id == main.ManpowerRequest.id)
+        .filter(HireRecord.contractor_user_id == user.id).order_by(PayrollInvoiceRecord.id.desc()).all())
+    headers = ["Record","Worker","Company","Trade","Location","Regular Hours","OT Hours","Worker Gross","Contractor Billing","Payroll Status","Invoice Status","Period Start","Period End","Due Date","Invoice Number","Payroll Batch","Payroll Paid","Invoice Paid"]
+    lines = [",".join(_csv_cell(x) for x in headers)]
+    for r,h,w,j in records:
+        values=[r.id,w.name,j.company,j.trade,h.job_location or j.location,r.regular_hours,r.overtime_hours,r.worker_gross_pay,r.contractor_billing,r.payroll_status,r.invoice_status,r.period_start,r.period_end,r.invoice_due_date,r.invoice_number,r.payroll_batch_number,r.payroll_paid_date,r.invoice_paid_date]
+        lines.append(",".join(_csv_cell(x) for x in values))
+    body = "\ufeff" + "\n".join(lines)
+    return Response(content=body, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="tradeforce-payroll-billing.csv"'})
+
+
+@router.get("/hire/{application_id}/record/{record_id}/statement")
+def payroll_invoice_statement(application_id: int, record_id: int, request: Request, db: main.Session = Depends(main.get_db)):
+    user = main.require_user(request, db)
+    app_row = _application(db, application_id); hire = _hire(db, application_id)
+    if not _allowed_relationship(user, app_row) or not hire:
+        raise HTTPException(status_code=404, detail="Record not found")
+    record = db.query(PayrollInvoiceRecord).filter(PayrollInvoiceRecord.id == record_id, PayrollInvoiceRecord.hire_id == hire.id).first()
+    if not record: raise HTTPException(status_code=404, detail="Record not found")
+    worker = db.query(main.Worker).filter(main.Worker.id == hire.worker_id).first(); job = db.query(main.ManpowerRequest).filter(main.ManpowerRequest.id == hire.job_id).first()
+    return main.templates.TemplateResponse("payroll_statement.html", {"request":request,"user":user,"record":record,"hire":hire,"worker":worker,"job":job})
 
 
 @router.get("/hire/{application_id}", response_class=HTMLResponse)
