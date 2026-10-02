@@ -1,3 +1,4 @@
+import html
 import hashlib
 import os
 import secrets
