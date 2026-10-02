@@ -675,7 +675,26 @@ def send_message(recipient_id: int, request: Request, body: str = Form(...), db:
     clean = body.strip()
     if not clean: return RedirectResponse(f"/messages?with_user={recipient_id}", status_code=303)
     if len(clean) > 4000: raise HTTPException(status_code=413, detail="Message must be 4,000 characters or fewer.")
-    db.add(Message(sender_user_id=user.id, recipient_user_id=recipient_id, application_id=relationship.id, body=clean)); notify(db, recipient_id, "New recruiting message", "You have a new message in TradeForce AI."); db.commit()
+    db.add(Message(sender_user_id=user.id, recipient_user_id=recipient_id, application_id=relationship.id, body=clean))
+    notify(db, recipient_id, "New message", "You have a new message in TradeForce AI.")
+    db.commit()
+    # Phase 13 email alert. Email failure must never block in-app messaging.
+    try:
+        from account_security import _send_email
+        app_url = (os.getenv("APP_BASE_URL") or "https://tradeforce-ai.com").rstrip("/")
+        sender_label = user.email
+        sender_worker = db.query(Worker).filter(Worker.user_id == user.id).first()
+        sender_company = db.query(CompanyProfile).filter(CompanyProfile.user_id == user.id).first()
+        if sender_worker and sender_worker.name:
+            sender_label = sender_worker.name
+        elif sender_company and sender_company.company_name:
+            sender_label = sender_company.company_name
+        safe_sender = html.escape(sender_label)
+        safe_preview = html.escape(clean[:240])
+        conversation_url = app_url + "/messages?with_user=" + str(user.id)
+        _send_email(recipient.email, f"New TradeForce AI message from {sender_label}", f"<h2>You have a new TradeForce AI message</h2><p><strong>{safe_sender}</strong> sent you:</p><p>{safe_preview}</p><p><a href=\"{html.escape(conversation_url, quote=True)}\">Open the conversation</a></p>")
+    except Exception:
+        pass
     return RedirectResponse(f"/messages?with_user={recipient_id}", status_code=303)
 
 
