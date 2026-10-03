@@ -452,6 +452,7 @@ def submit_timesheet(application_id: int, request: Request, week_start: str = Fo
     db.add(row)
     main.notify(db, app_row.contractor_user_id, "Timesheet submitted", "A weekly timesheet is ready for review.")
     db.commit()
+    main.email_user(db, app_row.contractor_user_id, "Timesheet submitted", f"A weekly timesheet for week {week} is ready for review.", f"/hire/{application_id}")
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
 
@@ -474,6 +475,7 @@ def review_timesheet(application_id: int, timesheet_id: int, request: Request, a
     row.updated_at = main.now_iso()
     main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.")
     db.commit()
+    main.email_user(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet for week {row.week_start} was {row.status}.", f"/hire/{application_id}")
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
 
@@ -555,6 +557,14 @@ def update_payroll_invoice(application_id: int, record_id: int, request: Request
     if action == "pay_payroll": record.payroll_paid_date = main.now_iso()[:10]
     if action == "pay_invoice": record.invoice_paid_date = main.now_iso()[:10]
     db.commit()
+    if action == "process_payroll":
+        main.email_user(db, app_row.worker_user_id, "Payroll processed", "Your payroll record has been processed.", f"/hire/{application_id}")
+    elif action == "pay_payroll":
+        main.email_user(db, app_row.worker_user_id, "Payroll paid", "Your payroll record has been marked paid.", f"/hire/{application_id}")
+    elif action == "send_invoice":
+        main.email_user(db, app_row.contractor_user_id, "Invoice processed", "Your contractor invoice has been processed.", f"/hire/{application_id}")
+    elif action == "pay_invoice":
+        main.email_user(db, app_row.contractor_user_id, "Invoice paid", "Your contractor invoice has been marked paid.", f"/hire/{application_id}")
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
 
