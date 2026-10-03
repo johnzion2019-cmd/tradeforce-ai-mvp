@@ -316,6 +316,20 @@ def notify(db: Session, user_id: int, title: str, message: str):
 def notification_list(db: Session, user_id: int):
     return db.query(Notification).filter(Notification.user_id == user_id).order_by(Notification.id.desc()).limit(12).all()
 
+def email_user(db: Session, user_id: int, subject: str, message: str, path: str = "/dashboard"):
+    """Best-effort transactional email; failures never block the primary action."""
+    try:
+        from account_security import _send_email
+        account = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+        if not account or not account.email:
+            return
+        app_url = (os.getenv("APP_BASE_URL") or "https://tradeforce-ai.com").rstrip("/")
+        safe_message = html.escape(message)
+        link = html.escape(app_url + path, quote=True)
+        _send_email(account.email, subject, f"<h2>{html.escape(subject)}</h2><p>{safe_message}</p><p><a href=\"{link}\">Open TradeForce AI</a></p>")
+    except Exception:
+        pass
+
 
 def storage_enabled() -> bool:
     return bool(os.getenv("S3_BUCKET") and os.getenv("S3_ACCESS_KEY_ID") and os.getenv("S3_SECRET_ACCESS_KEY"))
@@ -502,6 +516,8 @@ def apply_to_job(job_id: int, request: Request, message: str = Form(""), db: Ses
     notify(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.")
     notify(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.")
     db.commit()
+    email_user(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.")
+    email_user(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.")
     return RedirectResponse(request.headers.get("referer") or "/dashboard", status_code=303)
 
 
@@ -536,6 +552,7 @@ def update_application_status(application_id: int, request: Request, new_status:
     job = job_for_application(db, app_row)
     notify(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
     db.commit()
+    email_user(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
     return RedirectResponse("/dashboard", status_code=303)
 
 
