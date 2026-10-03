@@ -385,6 +385,8 @@ def accept_offer(application_id: int, request: main.Request, db: main.Session = 
         f"You accepted the offer from {job.company if job else 'the contractor'}.",
     )
     db.commit()
+    main.email_user(db, app_row.contractor_user_id, "Offer accepted", f"{worker_name} accepted your offer for {job.trade if job else 'the position'}. You can now continue the hiring and onboarding process.")
+    main.email_user(db, user.id, "Offer accepted", f"You accepted the offer from {job.company if job else 'the contractor'}.", f"/hire/{application_id}")
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
@@ -422,6 +424,8 @@ def decline_offer(application_id: int, request: main.Request, db: main.Session =
         f"You declined the offer from {job.company if job else 'the contractor'}.",
     )
     db.commit()
+    main.email_user(db, app_row.contractor_user_id, "Offer declined", f"{worker_name} declined your offer for {job.trade if job else 'the position'}.")
+    main.email_user(db, user.id, "Offer declined", f"You declined the offer from {job.company if job else 'the contractor'}.")
     return main.RedirectResponse("/dashboard", status_code=303)
 
 @app.get("/notifications", response_class=main.HTMLResponse)
