@@ -553,6 +553,9 @@ def update_application_status(application_id: int, request: Request, new_status:
     notify(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
     db.commit()
     email_user(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
+    if new_status == "hired":
+        email_user(db, app_row.worker_user_id, "You have been hired", f"You have been marked hired for {job.trade if job else 'the position'}. Continue to your onboarding details.", f"/hire/{application_id}")
+        email_user(db, app_row.contractor_user_id, "Candidate hired", f"The candidate has been marked hired for {job.trade if job else 'the position'}.", f"/hire/{application_id}")
     return RedirectResponse("/dashboard", status_code=303)
 
 
