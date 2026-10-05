@@ -1,4 +1,6 @@
 """Phase 6: hire details, onboarding checklist, and post-hire assignment lifecycle."""
+import html
+import os
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, inspect, text
@@ -397,6 +399,7 @@ def update_onboarding(
         )
         db.add(hire)
     worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
+    was_cleared_to_start = bool(hire.cleared_to_start)
     hire.documents_verified = documents_verified == "yes"
     hire.orientation_complete = orientation_complete == "yes"
     requested_clearance = cleared_to_start == "yes"
@@ -418,6 +421,30 @@ def update_onboarding(
     else:
         main.notify(db, app_row.worker_user_id, "Onboarding updated", "Your contractor updated your onboarding checklist.")
     db.commit()
+
+    # Send the worker a transactional email only on the transition to cleared.
+    # Email delivery is best-effort and must never block onboarding updates.
+    if hire.cleared_to_start and not was_cleared_to_start:
+        try:
+            from account_security import _send_email
+            worker_account = db.query(main.UserAccount).filter(main.UserAccount.id == app_row.worker_user_id).first()
+            job = db.query(main.ManpowerRequest).filter(main.ManpowerRequest.id == app_row.job_id).first()
+            if worker_account:
+                worker_name = (worker.name if worker and worker.name else "Worker")
+                trade = (job.trade if job and job.trade else "your assignment")
+                app_url = (os.getenv("APP_BASE_URL") or "https://tradeforce-ai.com").rstrip("/")
+                _send_email(
+                    worker_account.email,
+                    "You're cleared to start",
+                    (
+                        "<h2>You're cleared to start</h2>"
+                        f"<p>{html.escape(worker_name)}, your onboarding is 100% complete and your contractor has cleared you to start "
+                        f"<strong>{html.escape(trade)}</strong>.</p>"
+                        f"<p><a href=\"{html.escape(app_url + '/hire/' + str(application_id), quote=True)}\">Open TradeForce AI</a></p>"
+                    ),
+                )
+        except Exception:
+            pass
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
 
