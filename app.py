@@ -351,7 +351,7 @@ def reopen_job(job_id: int, request: main.Request, db: main.Session = main.Depen
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
-@app.post("/application/{application_id}/offer/accept")
+@app.api_route("/application/{application_id}/offer/accept", methods=["GET", "POST"])
 def accept_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
     """Allow the worker who owns an application to accept a contractor offer."""
     user = main.require_user(request, db, "worker")
@@ -390,7 +390,7 @@ def accept_offer(application_id: int, request: main.Request, db: main.Session = 
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
-@app.post("/application/{application_id}/offer/decline")
+@app.api_route("/application/{application_id}/offer/decline", methods=["GET", "POST"])
 def decline_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
     """Allow the worker who owns an application to decline a contractor offer."""
     user = main.require_user(request, db, "worker")
