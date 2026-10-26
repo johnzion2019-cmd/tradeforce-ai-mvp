@@ -98,9 +98,12 @@ def _hydrate_stripe_secrets_from_b64():
         if missing:
             continue
         try:
-            os.environ[target] = base64.b64decode("".join(parts)).decode()
+            decoded = base64.b64decode("".join(parts)).decode()
         except ValueError:
             continue
+        if not decoded:
+            continue
+        os.environ[target] = decoded
 
 
 _hydrate_stripe_secrets_from_chunks()
