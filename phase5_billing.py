@@ -3,11 +3,13 @@
 Register with the FastAPI application from app.py. Secrets stay in environment variables.
 """
 import base64
+import hashlib
 import html
 import os
+import secrets
 
 import stripe
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import Column, Integer, String, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -263,6 +265,107 @@ def phase5_health():
         "webhook_configured": bool(os.getenv("STRIPE_WEBHOOK_SECRET")),
         **_stripe_health_diagnostics(),
     }
+
+
+def _admin_reset_configured_token() -> str | None:
+    token = os.getenv("ADMIN_RESET_TOKEN")
+    if token is None or token == "":
+        return None
+    return token
+
+
+def _admin_token_matches(provided: str, expected: str) -> bool:
+    # Compare digests so the check does not leak the token through timing or logs.
+    provided_digest = hashlib.sha256(provided.encode("utf-8")).digest()
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).digest()
+    return secrets.compare_digest(provided_digest, expected_digest)
+
+
+def _require_admin_reset_token(provided: str | None) -> None:
+    expected = _admin_reset_configured_token()
+    if expected is None:
+        raise HTTPException(status_code=503, detail="Admin reset is not configured.")
+    candidate = provided if isinstance(provided, str) else ""
+    if not _admin_token_matches(candidate, expected):
+        raise HTTPException(status_code=401, detail="Invalid admin token.")
+
+
+async def _reset_email_from_request(request: Request) -> str:
+    content_type = (request.headers.get("content-type") or "").lower()
+    raw = ""
+    if "application/json" in content_type:
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body.")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object.")
+        value = payload.get("email", "")
+        raw = value if isinstance(value, str) else ""
+    else:
+        try:
+            form = await request.form()
+        except Exception:
+            raise HTTPException(status_code=400, detail="A contractor email is required.")
+        value = form.get("email", "")
+        raw = value if isinstance(value, str) else ""
+    email = raw.strip().lower()
+    if not email or "@" not in email or len(email) > 220:
+        raise HTTPException(status_code=400, detail="A contractor email is required.")
+    return email
+
+
+def _plan_status_view(sub):
+    if sub is None:
+        return {"plan": None, "status": None}
+    plan, status = subscription_plan_status(sub)
+    return {"plan": plan, "status": status}
+
+
+def _clear_subscription(sub: Subscription) -> None:
+    sub.plan = "starter"
+    sub.status = "inactive"
+    sub.stripe_customer_id = ""
+    sub.stripe_subscription_id = ""
+    sub.current_period_end = ""
+
+
+@router.post("/phase5/admin/reset-subscription")
+async def admin_reset_subscription(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Clear one contractor subscription left over from Stripe test mode.
+
+    Sets plan=starter, status=inactive, and blanks Stripe ids. The response
+    reports user id, email, and plan/status only. Do not log the admin token
+    or Stripe identifiers.
+    """
+    _require_admin_reset_token(x_admin_token)
+    email = await _reset_email_from_request(request)
+    with SessionLocal() as db:
+        row = db.execute(
+            text("SELECT id, email, role FROM account_users WHERE lower(email) = :email"),
+            {"email": email},
+        ).first()
+        if not row or (row.role or "").strip().lower() != "contractor":
+            raise HTTPException(status_code=404, detail="Contractor account not found.")
+        user_id = int(row.id)
+        sub = db.query(Subscription).filter(Subscription.user_id == user_id).first()
+        before = _plan_status_view(sub)
+        if sub is None:
+            sub = Subscription(user_id=user_id)
+            db.add(sub)
+        _clear_subscription(sub)
+        db.commit()
+        db.refresh(sub)
+        after = _plan_status_view(sub)
+        return {
+            "user_id": user_id,
+            "email": row.email,
+            "before": before,
+            "after": after,
+        }
 
 
 @router.get("/billing", response_class=HTMLResponse)

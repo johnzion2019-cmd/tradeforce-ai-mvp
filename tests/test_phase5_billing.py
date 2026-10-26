@@ -11,9 +11,10 @@ os.environ["DATABASE_URL"] = "sqlite:///" + _db_file.name
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 import phase5_billing
-from phase5_billing import billing_page, router, upgrade_cta_visible
+from phase5_billing import SessionLocal, Subscription, billing_page, router, upgrade_cta_visible
 
 
 STRIPE_ENV = {
@@ -262,6 +263,161 @@ class CheckoutGuardTests(StripeEnvMixin):
         self.assertEqual(response.headers["location"], "https://billing.stripe.test/p/session")
         self.assertEqual(opened[0]["customer"], "cus_123")
         self.assertTrue(opened[0]["return_url"].endswith("/billing"))
+
+
+class AdminResetSubscriptionTests(unittest.TestCase):
+    EMAIL = "tfai-e2e-contractor-20261025@example.com"
+    TOKEN = "reset-token-test"
+
+    def setUp(self):
+        app = FastAPI()
+        app.include_router(router)
+        self.client = TestClient(app)
+        self._saved_token = os.environ.get("ADMIN_RESET_TOKEN")
+        os.environ["ADMIN_RESET_TOKEN"] = self.TOKEN
+        self._seed_contractor(plan="pro", status="active")
+
+    def tearDown(self):
+        if self._saved_token is None:
+            os.environ.pop("ADMIN_RESET_TOKEN", None)
+        else:
+            os.environ["ADMIN_RESET_TOKEN"] = self._saved_token
+        with phase5_billing.engine.begin() as conn:
+            conn.execute(text("DELETE FROM subscriptions WHERE user_id IN (7, 8)"))
+            conn.execute(text("DELETE FROM account_users WHERE id IN (7, 8)"))
+
+    def _ensure_accounts(self):
+        with phase5_billing.engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS account_users (
+                        id INTEGER PRIMARY KEY,
+                        email VARCHAR(220) NOT NULL UNIQUE,
+                        role VARCHAR(30) NOT NULL
+                    )
+                    """
+                )
+            )
+
+    def _seed_contractor(self, plan, status, user_id=7, email=None, role="contractor", with_subscription=True):
+        email = email or self.EMAIL
+        self._ensure_accounts()
+        with phase5_billing.engine.begin() as conn:
+            conn.execute(text("DELETE FROM subscriptions WHERE user_id = :user_id"), {"user_id": user_id})
+            conn.execute(text("DELETE FROM account_users WHERE id = :user_id OR email = :email"), {"user_id": user_id, "email": email})
+            conn.execute(
+                text("INSERT INTO account_users (id, email, role) VALUES (:user_id, :email, :role)"),
+                {"user_id": user_id, "email": email, "role": role},
+            )
+            if with_subscription:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO subscriptions (
+                            user_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end
+                        ) VALUES (
+                            :user_id, :plan, :status, 'cus_test_sandbox', 'sub_test_sandbox', '1730000000'
+                        )
+                        """
+                    ),
+                    {"user_id": user_id, "plan": plan, "status": status},
+                )
+
+    def _subscription(self, user_id=7):
+        with SessionLocal() as db:
+            return db.query(Subscription).filter(Subscription.user_id == user_id).one_or_none()
+
+    def test_token_required(self):
+        missing = self.client.post("/phase5/admin/reset-subscription", json={"email": self.EMAIL})
+        self.assertEqual(missing.status_code, 401)
+        self.assertNotIn(self.TOKEN, missing.text)
+
+        wrong = self.client.post(
+            "/phase5/admin/reset-subscription",
+            json={"email": self.EMAIL},
+            headers={"X-Admin-Token": "not-the-token"},
+        )
+        self.assertEqual(wrong.status_code, 401)
+        unchanged = self._subscription()
+        self.assertEqual(unchanged.plan, "pro")
+        self.assertEqual(unchanged.status, "active")
+        self.assertEqual(unchanged.stripe_customer_id, "cus_test_sandbox")
+
+        os.environ.pop("ADMIN_RESET_TOKEN", None)
+        unconfigured = self.client.post(
+            "/phase5/admin/reset-subscription",
+            json={"email": self.EMAIL},
+            headers={"X-Admin-Token": self.TOKEN},
+        )
+        self.assertEqual(unconfigured.status_code, 503)
+        still = self._subscription()
+        self.assertEqual(still.plan, "pro")
+        self.assertEqual(still.status, "active")
+
+    def test_successful_reset(self):
+        response = self.client.post(
+            "/phase5/admin/reset-subscription",
+            json={"email": self.EMAIL},
+            headers={"X-Admin-Token": self.TOKEN},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["user_id"], 7)
+        self.assertEqual(body["email"], self.EMAIL)
+        self.assertEqual(body["before"], {"plan": "pro", "status": "active"})
+        self.assertEqual(body["after"], {"plan": "starter", "status": "inactive"})
+        self.assertNotIn("cus_test_sandbox", response.text)
+        self.assertNotIn("sub_test_sandbox", response.text)
+        self.assertNotIn(self.TOKEN, response.text)
+        reset = self._subscription()
+        self.assertEqual(reset.plan, "starter")
+        self.assertEqual(reset.status, "inactive")
+        self.assertEqual(reset.stripe_customer_id, "")
+        self.assertEqual(reset.stripe_subscription_id, "")
+        self.assertEqual(reset.current_period_end, "")
+
+        self._seed_contractor(plan="pro", status="active")
+        form = self.client.post(
+            "/phase5/admin/reset-subscription",
+            data={"email": self.EMAIL},
+            headers={"X-Admin-Token": self.TOKEN},
+        )
+        self.assertEqual(form.status_code, 200)
+        self.assertEqual(form.json()["before"], {"plan": "pro", "status": "active"})
+        self.assertEqual(form.json()["after"], {"plan": "starter", "status": "inactive"})
+
+        with phase5_billing.engine.begin() as conn:
+            conn.execute(text("DELETE FROM subscriptions WHERE user_id = 7"))
+        created = self.client.post(
+            "/phase5/admin/reset-subscription",
+            json={"email": "  " + self.EMAIL.upper() + "  "},
+            headers={"X-Admin-Token": self.TOKEN},
+        )
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(created.json()["before"], {"plan": None, "status": None})
+        self.assertEqual(created.json()["after"], {"plan": "starter", "status": "inactive"})
+        self.assertEqual(created.json()["user_id"], 7)
+        inserted = self._subscription()
+        self.assertEqual(inserted.plan, "starter")
+        self.assertEqual(inserted.stripe_subscription_id, "")
+
+        self._seed_contractor(
+            plan="pro",
+            status="active",
+            user_id=8,
+            email="worker-20261025@example.com",
+            role="worker",
+        )
+        rejected = self.client.post(
+            "/phase5/admin/reset-subscription",
+            json={"email": "worker-20261025@example.com"},
+            headers={"X-Admin-Token": self.TOKEN},
+        )
+        self.assertEqual(rejected.status_code, 404)
+        worker_sub = self._subscription(8)
+        self.assertEqual(worker_sub.plan, "pro")
+        self.assertEqual(worker_sub.status, "active")
 
 
 if __name__ == "__main__":
