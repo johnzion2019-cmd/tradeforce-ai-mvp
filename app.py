@@ -346,7 +346,7 @@ def reopen_job(job_id: int, request: main.Request, db: main.Session = main.Depen
         raise main.HTTPException(status_code=404, detail="Job not found")
     if job.status == "closed":
         job.status = "open"
-        main.notify(db, user.id, "Manpower request reopened", f"Your {job.trade} request is open again.")
+        main.notify(db, user.id, "Manpower request reopened", f"Your {job.trade} request is open again.", "/dashboard")
         db.commit()
     return main.RedirectResponse("/dashboard", status_code=303)
 
@@ -372,21 +372,24 @@ def accept_offer(application_id: int, request: main.Request, db: main.Session = 
     job = main.job_for_application(db, app_row)
     worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
     worker_name = worker.name if worker else "Candidate"
+    offer_link = f"/hire/{application_id}"
     main.notify(
         db,
         app_row.contractor_user_id,
         "Offer accepted",
         f"{worker_name} accepted your offer for {job.trade if job else 'the position'}. You can now mark the candidate as hired.",
+        offer_link,
     )
     main.notify(
         db,
         user.id,
         "Offer accepted",
         f"You accepted the offer from {job.company if job else 'the contractor'}.",
+        offer_link,
     )
     db.commit()
-    main.email_user(db, app_row.contractor_user_id, "Offer accepted", f"{worker_name} accepted your offer for {job.trade if job else 'the position'}. You can now continue the hiring and onboarding process.")
-    main.email_user(db, user.id, "Offer accepted", f"You accepted the offer from {job.company if job else 'the contractor'}.", f"/hire/{application_id}")
+    main.email_user(db, app_row.contractor_user_id, "Offer accepted", f"{worker_name} accepted your offer for {job.trade if job else 'the position'}. You can now continue the hiring and onboarding process.", offer_link)
+    main.email_user(db, user.id, "Offer accepted", f"You accepted the offer from {job.company if job else 'the contractor'}.", offer_link)
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
@@ -416,23 +419,25 @@ def decline_offer(application_id: int, request: main.Request, db: main.Session =
         app_row.contractor_user_id,
         "Offer declined",
         f"{worker_name} declined your offer for {job.trade if job else 'the position'}.",
+        "/dashboard",
     )
     main.notify(
         db,
         user.id,
         "Offer declined",
         f"You declined the offer from {job.company if job else 'the contractor'}.",
+        "/dashboard",
     )
     db.commit()
-    main.email_user(db, app_row.contractor_user_id, "Offer declined", f"{worker_name} declined your offer for {job.trade if job else 'the position'}.")
-    main.email_user(db, user.id, "Offer declined", f"You declined the offer from {job.company if job else 'the contractor'}.")
+    main.email_user(db, app_row.contractor_user_id, "Offer declined", f"{worker_name} declined your offer for {job.trade if job else 'the position'}.", "/dashboard")
+    main.email_user(db, user.id, "Offer declined", f"You declined the offer from {job.company if job else 'the contractor'}.", "/dashboard")
     return main.RedirectResponse("/dashboard", status_code=303)
 
 @app.get("/notifications", response_class=main.HTMLResponse)
 def notifications_page(request: main.Request, db: main.Session = main.Depends(main.get_db)):
     user = main.require_user(request, db)
     items = db.query(main.Notification).filter(main.Notification.user_id == user.id).order_by(main.Notification.id.desc()).limit(100).all()
-    unread_count = sum(1 for item in items if not item.is_read)
+    unread_count = db.query(main.Notification).filter(main.Notification.user_id == user.id, main.Notification.is_read.is_(False)).count()
     return main.templates.TemplateResponse("notifications.html", {"request": request, "user": user, "notifications": items, "unread_count": unread_count})
 
 @app.post("/notifications/read-all")

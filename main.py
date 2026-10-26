@@ -5,6 +5,7 @@ import secrets
 import uuid
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -99,6 +100,7 @@ class Notification(Base):
     user_id = Column(Integer, ForeignKey("account_users.id"), nullable=False, index=True)
     title = Column(String(200), nullable=False)
     message = Column(Text, default="")
+    link = Column(String(500), default="")
     is_read = Column(Boolean, default=False)
     created_at = Column(String(40), default=now_iso)
 
@@ -179,6 +181,9 @@ def migrate_existing_tables():
             "user_id": "INTEGER",
             "required_experience": "INTEGER DEFAULT 0",
             "status": "TEXT DEFAULT 'open'",
+        },
+        "notifications": {
+            "link": "TEXT DEFAULT ''",
         },
     }
     with engine.begin() as conn:
@@ -309,12 +314,103 @@ def worker_job_matches(worker, jobs, limit=12):
     return [m for m in ranked if m["score"] >= 35][:limit]
 
 
-def notify(db: Session, user_id: int, title: str, message: str):
-    db.add(Notification(user_id=user_id, title=title, message=message))
+def safe_notification_link(link: Optional[str]) -> str:
+    """Keep notification destinations inside this app. Rejects external and script URLs."""
+    if link is None:
+        return ""
+    value = str(link).strip()
+    if not value or len(value) > 500 or any(ch in value for ch in ("\r", "\n", "\x00", "\\")):
+        return ""
+    lowered = value.lower()
+    if "javascript:" in lowered or "data:" in lowered:
+        return ""
+    if value.startswith("/") and not value.startswith("//"):
+        if _is_notification_open_path(value):
+            return ""
+        return value
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    host = parsed.netloc.lower()
+    allowed = {"tradeforce-ai.com", "www.tradeforce-ai.com"}
+    base = (os.getenv("APP_BASE_URL") or "").strip()
+    if base:
+        base_host = urlparse(base).netloc.lower()
+        if base_host:
+            allowed.add(base_host)
+    if host not in allowed:
+        return ""
+    path = parsed.path or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return ""
+    query = f"?{parsed.query}" if parsed.query else ""
+    destination = path + query
+    if _is_notification_open_path(destination):
+        return ""
+    return destination
+
+
+def _is_notification_open_path(value: str) -> bool:
+    head = value.split("?", 1)[0].rstrip("/")
+    parts = head.split("/")
+    return len(parts) == 4 and parts[1] == "notifications" and parts[2].isdigit() and parts[3] == "open"
+
+
+def notify(db: Session, user_id: int, title: str, message: str, link: str = ""):
+    db.add(Notification(user_id=user_id, title=title, message=message, link=safe_notification_link(link)))
 
 
 def notification_list(db: Session, user_id: int):
     return db.query(Notification).filter(Notification.user_id == user_id).order_by(Notification.id.desc()).limit(12).all()
+
+
+def nav_unread(request: Request, kind: str) -> int:
+    """Unread message and notification counts for the signed-in nav. Never raises."""
+    counts = getattr(request.state, "nav_unread_counts", None)
+    if counts is None:
+        counts = {"messages": 0, "notifications": 0}
+        user_id = None
+        try:
+            user_id = request.session.get("user_id")
+        except Exception:
+            user_id = None
+        if user_id:
+            db = SessionLocal()
+            try:
+                counts = {
+                    "messages": db.query(Message).filter(Message.recipient_user_id == user_id, Message.is_read.is_(False)).count(),
+                    "notifications": db.query(Notification).filter(Notification.user_id == user_id, Notification.is_read.is_(False)).count(),
+                }
+            except Exception:
+                counts = {"messages": 0, "notifications": 0}
+            finally:
+                db.close()
+        try:
+            request.state.nav_unread_counts = counts
+        except Exception:
+            pass
+    try:
+        return int(counts.get(kind) or 0)
+    except Exception:
+        return 0
+
+
+templates.env.globals["nav_unread"] = nav_unread
+
+
+def notification_return_path(request: Request) -> str:
+    """Same-app page to return to when a notification has no destination."""
+    referer = request.headers.get("referer") or ""
+    parsed = urlparse(referer)
+    if parsed.netloc and parsed.netloc != request.url.netloc:
+        return "/notifications"
+    path = parsed.path or ""
+    if not path.startswith("/") or path.startswith("//") or "\\" in path:
+        return "/notifications"
+    if path.rstrip("/").endswith("/open") and "/notifications/" in path:
+        return "/notifications"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return path + query
 
 def email_user(db: Session, user_id: int, subject: str, message: str, path: str = "/dashboard"):
     """Best-effort transactional email; failures never block the primary action."""
@@ -438,14 +534,13 @@ def contractor_entry(request: Request, db: Session = Depends(get_db)):
 def dashboard(request: Request, db: Session = Depends(get_db)):
     user = require_user(request, db)
     notifications = notification_list(db, user.id)
-    unread_messages = db.query(Message).filter(Message.recipient_user_id == user.id, Message.is_read.is_(False)).count()
     if user.role == "worker":
         worker = db.query(Worker).filter(Worker.user_id == user.id).first()
         jobs = db.query(ManpowerRequest).filter(ManpowerRequest.status == "open").order_by(ManpowerRequest.id.desc()).all()
         matches = worker_job_matches(worker, jobs) if worker else []
         apps = db.query(Application).filter(Application.worker_user_id == user.id).order_by(Application.id.desc()).all()
         app_map = {a.job_id: a for a in apps}
-        return templates.TemplateResponse("worker_dashboard.html", {"request": request, "user": user, "worker": worker, "matches": matches, "notifications": notifications, "applications": apps, "app_map": app_map, "unread_messages": unread_messages})
+        return templates.TemplateResponse("worker_dashboard.html", {"request": request, "user": user, "worker": worker, "matches": matches, "notifications": notifications, "applications": apps, "app_map": app_map})
     jobs = db.query(ManpowerRequest).filter(ManpowerRequest.user_id == user.id).order_by(ManpowerRequest.id.desc()).all()
     workers = db.query(Worker).filter(Worker.available.is_(True)).all()
     matches = {job.id: ranked_matches(workers, job) for job in jobs}
@@ -456,7 +551,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         applications_by_job.setdefault(a.job_id, []).append({"application": a, "worker": worker_lookup.get(a.worker_id)})
     favorite_ids = {row.worker_id for row in db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).all()}
     company_profile = db.query(CompanyProfile).filter(CompanyProfile.user_id == user.id).first()
-    return templates.TemplateResponse("contractor_dashboard.html", {"request": request, "user": user, "jobs": jobs, "matches": matches, "notifications": notifications, "applications_by_job": applications_by_job, "favorite_ids": favorite_ids, "company_profile": company_profile, "unread_messages": unread_messages})
+    return templates.TemplateResponse("contractor_dashboard.html", {"request": request, "user": user, "jobs": jobs, "matches": matches, "notifications": notifications, "applications_by_job": applications_by_job, "favorite_ids": favorite_ids, "company_profile": company_profile})
 
 
 @app.post("/worker/profile")
@@ -478,7 +573,7 @@ async def save_worker_profile(request: Request, name: str = Form(...), trade: st
     db.commit()
     strong = worker_job_matches(worker, db.query(ManpowerRequest).filter(ManpowerRequest.status == "open").all(), limit=3)
     if strong:
-        notify(db, user.id, "New job matches ready", f"Your updated profile has {len(strong)} strong job match(es).")
+        notify(db, user.id, "New job matches ready", f"Your updated profile has {len(strong)} strong job match(es).", "/opportunities")
         db.commit()
     return RedirectResponse("/dashboard", status_code=303)
 
@@ -491,8 +586,8 @@ def create_job(request: Request, company: str = Form(...), contact: str = Form("
     top = ranked_matches(db.query(Worker).filter(Worker.available.is_(True)).all(), job, limit=10)
     for match in top:
         if match["score"] >= 60 and match["worker"].user_id:
-            notify(db, match["worker"].user_id, f"New {job.trade} opportunity", f"{job.company} posted a {job.trade} job in {job.location or 'a new location'} with a {match['score']}% match to your profile.")
-    notify(db, user.id, "Manpower request posted", f"Your {job.trade} request is live with {len(top)} ranked candidate match(es).")
+            notify(db, match["worker"].user_id, f"New {job.trade} opportunity", f"{job.company} posted a {job.trade} job in {job.location or 'a new location'} with a {match['score']}% match to your profile.", "/opportunities?trade=" + quote(job.trade or ""))
+    notify(db, user.id, "Manpower request posted", f"Your {job.trade} request is live with {len(top)} ranked candidate match(es).", "/dashboard")
     db.commit()
     return RedirectResponse("/dashboard", status_code=303)
 
@@ -513,11 +608,11 @@ def apply_to_job(job_id: int, request: Request, message: str = Form(""), db: Ses
     else:
         app_row = Application(job_id=job.id, worker_id=worker.id, worker_user_id=user.id, contractor_user_id=job.user_id, source="application", status="applied", message=message.strip())
         db.add(app_row)
-    notify(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.")
-    notify(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.")
+    notify(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.", f"/worker/{worker.id}")
+    notify(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.", "/dashboard")
     db.commit()
-    email_user(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.")
-    email_user(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.")
+    email_user(db, job.user_id, f"New applicant: {worker.name}", f"{worker.name} applied to your {job.trade} request.", f"/worker/{worker.id}")
+    email_user(db, user.id, "Application sent", f"Your application to {job.company} — {job.trade} was submitted.", "/dashboard")
     return RedirectResponse(request.headers.get("referer") or "/dashboard", status_code=303)
 
 
@@ -533,8 +628,8 @@ def invite_worker(job_id: int, worker_id: int, request: Request, db: Session = D
         db.add(Application(job_id=job.id, worker_id=worker.id, worker_user_id=worker.user_id, contractor_user_id=user.id, source="invite", status="invited"))
     elif app_row.status in {"rejected", "withdrawn"}:
         app_row.status = "invited"; app_row.source = "invite"; app_row.updated_at = now_iso()
-    notify(db, worker.user_id, f"Invitation from {job.company}", f"You were invited to apply for {job.trade}.")
-    notify(db, user.id, "Worker invited", f"Invitation sent to {worker.name} for your {job.trade} request.")
+    notify(db, worker.user_id, f"Invitation from {job.company}", f"You were invited to apply for {job.trade}.", "/dashboard")
+    notify(db, user.id, "Worker invited", f"Invitation sent to {worker.name} for your {job.trade} request.", f"/worker/{worker.id}")
     db.commit()
     return RedirectResponse(request.headers.get("referer") or "/dashboard", status_code=303)
 
@@ -550,9 +645,12 @@ def update_application_status(application_id: int, request: Request, new_status:
         raise HTTPException(status_code=404, detail="Application not found")
     app_row.status = new_status; app_row.updated_at = now_iso()
     job = job_for_application(db, app_row)
-    notify(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
+    status_link = f"/hire/{application_id}" if new_status == "hired" else "/dashboard"
+    notify(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.", status_link)
+    if new_status == "hired":
+        notify(db, app_row.contractor_user_id, "Candidate hired", f"The candidate has been marked hired for {job.trade if job else 'the position'}.", f"/hire/{application_id}")
     db.commit()
-    email_user(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.")
+    email_user(db, app_row.worker_user_id, "Application status updated", f"Your {job.trade if job else 'job'} application is now: {new_status}.", status_link)
     if new_status == "hired":
         email_user(db, app_row.worker_user_id, "You have been hired", f"You have been marked hired for {job.trade if job else 'the position'}. Continue to your onboarding details.", f"/hire/{application_id}")
         email_user(db, app_row.contractor_user_id, "Candidate hired", f"The candidate has been marked hired for {job.trade if job else 'the position'}.", f"/hire/{application_id}")
@@ -566,7 +664,7 @@ def withdraw_application(application_id: int, request: Request, db: Session = De
     if not app_row:
         raise HTTPException(status_code=404, detail="Application not found")
     if app_row.status not in {"hired", "rejected"}:
-        app_row.status = "withdrawn"; app_row.updated_at = now_iso(); notify(db, app_row.contractor_user_id, "Candidate withdrew", "A candidate withdrew from your manpower request."); db.commit()
+        app_row.status = "withdrawn"; app_row.updated_at = now_iso(); notify(db, app_row.contractor_user_id, "Candidate withdrew", "A candidate withdrew from your manpower request.", "/dashboard"); db.commit()
     return RedirectResponse("/dashboard", status_code=303)
 
 
@@ -697,7 +795,7 @@ def send_message(recipient_id: int, request: Request, body: str = Form(...), db:
     if not clean: return RedirectResponse(f"/messages?with_user={recipient_id}", status_code=303)
     if len(clean) > 4000: raise HTTPException(status_code=413, detail="Message must be 4,000 characters or fewer.")
     db.add(Message(sender_user_id=user.id, recipient_user_id=recipient_id, application_id=relationship.id, body=clean))
-    notify(db, recipient_id, "New message", "You have a new message in TradeForce AI.")
+    notify(db, recipient_id, "New message", "You have a new message in TradeForce AI.", f"/messages?with_user={user.id}")
     db.commit()
     # Phase 13 email alert. Email failure must never block in-app messaging.
     try:
@@ -738,6 +836,22 @@ def document_response(worker: Optional[Worker], kind: str):
     return Response(content=data, media_type=content_type, headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'})
 
 
+@app.get("/notifications/{notification_id}/open")
+def open_notification(notification_id: int, request: Request, db: Session = Depends(get_db)):
+    user = require_user(request, db)
+    item = db.query(Notification).filter(Notification.id == notification_id, Notification.user_id == user.id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    item.is_read = True
+    destination = safe_notification_link(item.link or "")
+    if not destination or urlparse(destination).path == request.url.path:
+        destination = notification_return_path(request)
+    db.commit()
+    response = RedirectResponse(destination, status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.post("/notifications/read")
 def mark_notifications_read(request: Request, db: Session = Depends(get_db)):
     user = require_user(request, db); db.query(Notification).filter(Notification.user_id == user.id).update({Notification.is_read: True}); db.commit(); return RedirectResponse("/dashboard", status_code=303)
@@ -763,6 +877,6 @@ def health():
     try:
         with engine.connect() as conn: conn.execute(text("SELECT 1"))
         database = "postgresql" if engine.dialect.name == "postgresql" else "sqlite"
-        return {"status": "ok", "service": "TradeForce AI", "database": database, "phase": 4, "document_storage": "object-storage" if storage_enabled() else "database-fallback", "features": ["messaging", "talent-search", "favorites", "company-profiles", "opportunity-search"]}
+        return {"status": "ok", "service": "TradeForce AI", "database": database, "phase": 13, "document_storage": "object-storage" if storage_enabled() else "database-fallback", "features": ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search"]}
     except Exception:
         raise HTTPException(status_code=503, detail="Database unavailable")
