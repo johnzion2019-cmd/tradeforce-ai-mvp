@@ -36,6 +36,7 @@ RATE_LIMITS = {
     "message": (30, 60),      # 30 message writes / minute / client
     "job": (20, 60),          # 20 job mutations / minute / client
     "apply": (30, 60),        # 30 application writes / minute / client
+    "admin_reset": (10, 300), # 10 token attempts / 5 minutes / client
     "mutation": (120, 60),    # fallback for other state-changing requests
 }
 
@@ -129,6 +130,8 @@ def _client_key(request: Request) -> str:
 
 def _rate_class(request: Request) -> str:
     path = request.url.path
+    if path == "/phase5/admin/reset-subscription":
+        return "admin_reset"
     if path == "/login":
         return "login"
     if path == "/signup":
@@ -280,12 +283,14 @@ app.include_router(phase6_router)
 async def production_security(request: Request, call_next):
     """Apply browser security, abuse controls, upload validation, and post-job email confirmation."""
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/stripe/webhook":
-        expected_host = urlparse(os.getenv("APP_BASE_URL", "")).netloc or request.url.netloc
-        origin = request.headers.get("origin")
-        referer = request.headers.get("referer")
-        source_host = urlparse(origin).netloc if origin else (urlparse(referer).netloc if referer else "")
-        if source_host and source_host != expected_host:
-            return PlainTextResponse("Cross-site request blocked.", status_code=403)
+        # The reset endpoint is called by an operator with X-Admin-Token, not from a browser form.
+        if request.url.path != "/phase5/admin/reset-subscription":
+            expected_host = urlparse(os.getenv("APP_BASE_URL", "")).netloc or request.url.netloc
+            origin = request.headers.get("origin")
+            referer = request.headers.get("referer")
+            source_host = urlparse(origin).netloc if origin else (urlparse(referer).netloc if referer else "")
+            if source_host and source_host != expected_host:
+                return PlainTextResponse("Cross-site request blocked.", status_code=403)
 
         blocked, retry_after = _rate_limited(request)
         if blocked:
