@@ -135,9 +135,41 @@ def account_email(db, uid):
     return row.email
 
 
+def subscription_plan_status(sub):
+    plan = (sub.plan if sub and sub.plan else "starter").strip().lower()
+    status = (sub.status if sub and sub.status else "inactive").strip().lower()
+    return plan, status
+
+
+def upgrade_cta_visible(sub):
+    """Which checkout CTAs the billing page should offer.
+
+    An active Pro subscription can still move up to Business. An active
+    Business subscription is the top plan, so neither checkout CTA is shown.
+    Starter and any non-active status keep both upgrades.
+    """
+    plan, status = subscription_plan_status(sub)
+    on_active_paid_plan = status == "active" and plan in {"pro", "business"}
+    return {
+        "pro": not on_active_paid_plan,
+        "business": not (on_active_paid_plan and plan == "business"),
+    }
+
+
+def _checkout_form(plan_slug, label, disabled):
+    return (
+        f'<form method="post" action="/billing/checkout/{plan_slug}">'
+        f'<button type="submit"{disabled}>{label}</button></form>'
+    )
+
+
+def _plan_state_note(message):
+    return f'<p class="plan-state">{html.escape(message)}</p>'
+
+
 def billing_page(email, sub):
-    plan = sub.plan if sub else "starter"
-    status = sub.status if sub else "inactive"
+    plan = (sub.plan if sub and sub.plan else "starter").strip() or "starter"
+    status = (sub.status if sub and sub.status else "inactive").strip() or "inactive"
     has_customer = bool(sub and sub.stripe_customer_id)
     configured = stripe_ready()
     safe_email = html.escape(email)
@@ -148,6 +180,18 @@ def billing_page(email, sub):
     if has_customer:
         manage = '<form method="post" action="/billing/portal"><button class="secondary" type="submit">Manage subscription</button></form>'
     notice = "" if configured else '<div class="notice">Stripe billing is not fully configured yet.</div>'
+    visible = upgrade_cta_visible(sub)
+    current_plan, _current_status = subscription_plan_status(sub)
+    pro_action = (
+        _checkout_form("pro", "Upgrade to Pro", disabled)
+        if visible["pro"]
+        else _plan_state_note("Current plan" if current_plan == "pro" else "Included in your plan")
+    )
+    business_action = (
+        _checkout_form("business", "Upgrade to Business", disabled)
+        if visible["business"]
+        else _plan_state_note("Current plan")
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -165,6 +209,7 @@ h1{{font-size:44px;line-height:1.05;margin:12px 0}} .sub{{color:var(--muted);fon
 .card h2{{font-size:28px;margin:0 0 8px}} .price{{font-size:42px;font-weight:800;margin:16px 0}} .price span{{font-size:16px;color:var(--muted);font-weight:400}}
 ul{{padding-left:20px;color:var(--muted);line-height:1.8}} button{{width:100%;border:0;border-radius:10px;padding:15px 18px;font-size:17px;font-weight:800;background:var(--orange);color:#101010;cursor:pointer}}
 button.secondary{{background:transparent;color:var(--text);border:1px solid var(--line);margin-top:12px}} button:disabled{{opacity:.45;cursor:not-allowed}}
+.plan-state{{margin:0;padding:15px 18px;border:1px solid var(--line);border-radius:10px;text-align:center;font-size:17px;font-weight:800;color:var(--muted)}}
 .back{{display:inline-block;color:var(--orange);text-decoration:none;margin-top:24px;font-weight:700}} .notice{{padding:12px 14px;background:#30200f;border:1px solid #6d4319;border-radius:10px;margin:20px 0}}
 @media(max-width:700px){{.grid{{grid-template-columns:1fr}}h1{{font-size:38px}}header{{font-size:24px}}}}
 </style>
@@ -178,8 +223,8 @@ button.secondary{{background:transparent;color:var(--text);border:1px solid var(
 {notice}
 <div class="current"><strong>Current plan:</strong> {safe_plan} &nbsp; · &nbsp; <strong>Status:</strong> {safe_status}<br><span style="color:var(--muted)">{safe_email}</span>{manage}</div>
 <div class="grid">
-<section class="card"><h2>TradeForce Pro</h2><div class="price">$99 <span>/ month</span></div><ul><li>Talent discovery and search</li><li>Candidate favorites and recruiting tools</li><li>Messaging tied to recruiting relationships</li></ul><form method="post" action="/billing/checkout/pro"><button type="submit"{disabled}>Upgrade to Pro</button></form></section>
-<section class="card"><h2>TradeForce Business</h2><div class="price">$249 <span>/ month</span></div><ul><li>Everything in Pro</li><li>Advanced contractor recruiting workflow</li><li>Built for higher-volume hiring teams</li></ul><form method="post" action="/billing/checkout/business"><button type="submit"{disabled}>Upgrade to Business</button></form></section>
+<section class="card"><h2>TradeForce Pro</h2><div class="price">$99 <span>/ month</span></div><ul><li>Talent discovery and search</li><li>Candidate favorites and recruiting tools</li><li>Messaging tied to recruiting relationships</li></ul>{pro_action}</section>
+<section class="card"><h2>TradeForce Business</h2><div class="price">$249 <span>/ month</span></div><ul><li>Everything in Pro</li><li>Advanced contractor recruiting workflow</li><li>Built for higher-volume hiring teams</li></ul>{business_action}</section>
 </div>
 <a class="back" href="/dashboard">← Back to contractor dashboard</a>
 </main>
@@ -240,6 +285,11 @@ def checkout(plan: str, request: Request):
     with SessionLocal() as db:
         email = account_email(db, uid)
         sub = db.query(Subscription).filter(Subscription.user_id == uid).first()
+        if not upgrade_cta_visible(sub).get(plan):
+            raise HTTPException(
+                status_code=409,
+                detail="That plan is already included in your active subscription. Use Manage subscription to make billing changes.",
+            )
         price = os.environ["STRIPE_PRO_PRICE_ID"] if plan == "pro" else os.environ["STRIPE_BUSINESS_PRICE_ID"]
         params = {
             "mode": "subscription",
