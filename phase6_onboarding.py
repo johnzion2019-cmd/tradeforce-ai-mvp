@@ -353,7 +353,7 @@ def save_hire_details(
     hire.duration = duration.strip()[:120]
     hire.notes = notes.strip()[:4000]
     hire.updated_at = main.now_iso()
-    main.notify(db, app_row.worker_user_id, "Hire details updated", f"{job.company if job else 'Your contractor'} updated your hire details. Please review and confirm them.")
+    main.notify(db, app_row.worker_user_id, "Hire details updated", f"{job.company if job else 'Your contractor'} updated your hire details. Please review and confirm them.", f"/hire/{application_id}")
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
@@ -370,7 +370,7 @@ def confirm_hire_details(application_id: int, request: Request, db: main.Session
     hire.worker_confirmed = True
     hire.updated_at = main.now_iso()
     worker = db.query(main.Worker).filter(main.Worker.id == app_row.worker_id).first()
-    main.notify(db, app_row.contractor_user_id, "Hire details confirmed", f"{worker.name if worker else 'Worker'} confirmed the start/pay/location details.")
+    main.notify(db, app_row.contractor_user_id, "Hire details confirmed", f"{worker.name if worker else 'Worker'} confirmed the start/pay/location details.", f"/hire/{application_id}")
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
@@ -417,9 +417,9 @@ def update_onboarding(
         hire.assignment_status = "ready_to_start"
     hire.updated_at = main.now_iso()
     if hire.cleared_to_start:
-        main.notify(db, app_row.worker_user_id, "Cleared to start", "Your contractor marked your onboarding as cleared to start.")
+        main.notify(db, app_row.worker_user_id, "Cleared to start", "Your contractor marked your onboarding as cleared to start.", f"/hire/{application_id}")
     else:
-        main.notify(db, app_row.worker_user_id, "Onboarding updated", "Your contractor updated your onboarding checklist.")
+        main.notify(db, app_row.worker_user_id, "Onboarding updated", "Your contractor updated your onboarding checklist.", f"/hire/{application_id}")
     db.commit()
 
     # Send the worker a transactional email only on the transition to cleared.
@@ -477,7 +477,7 @@ def submit_timesheet(application_id: int, request: Request, week_start: str = Fo
     else:
         row = Timesheet(hire_id=hire.id, week_start=week, regular_hours=str(regular), overtime_hours=str(overtime), notes=notes.strip()[:2000], status="submitted")
     db.add(row)
-    main.notify(db, app_row.contractor_user_id, "Timesheet submitted", "A weekly timesheet is ready for review.")
+    main.notify(db, app_row.contractor_user_id, "Timesheet submitted", "A weekly timesheet is ready for review.", f"/hire/{application_id}")
     db.commit()
     main.email_user(db, app_row.contractor_user_id, "Timesheet submitted", f"A weekly timesheet for week {week} is ready for review.", f"/hire/{application_id}")
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
@@ -500,7 +500,7 @@ def review_timesheet(application_id: int, timesheet_id: int, request: Request, a
     row.status = "approved" if action == "approve" else "rejected"
     row.contractor_notes = contractor_notes.strip()[:2000]
     row.updated_at = main.now_iso()
-    main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.")
+    main.notify(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet was {row.status}.", f"/hire/{application_id}")
     db.commit()
     main.email_user(db, app_row.worker_user_id, "Timesheet reviewed", f"Your timesheet for week {row.week_start} was {row.status}.", f"/hire/{application_id}")
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
@@ -583,15 +583,24 @@ def update_payroll_invoice(application_id: int, record_id: int, request: Request
     record.updated_at = main.now_iso()
     if action == "pay_payroll": record.payroll_paid_date = main.now_iso()[:10]
     if action == "pay_invoice": record.invoice_paid_date = main.now_iso()[:10]
+    payroll_link = f"/hire/{application_id}"
+    if action == "process_payroll":
+        main.notify(db, app_row.worker_user_id, "Payroll processed", "Your payroll record has been processed.", payroll_link)
+    elif action == "pay_payroll":
+        main.notify(db, app_row.worker_user_id, "Payroll paid", "Your payroll record has been marked paid.", payroll_link)
+    elif action == "send_invoice":
+        main.notify(db, app_row.contractor_user_id, "Invoice processed", "Your contractor invoice has been processed.", payroll_link)
+    elif action == "pay_invoice":
+        main.notify(db, app_row.contractor_user_id, "Invoice paid", "Your contractor invoice has been marked paid.", payroll_link)
     db.commit()
     if action == "process_payroll":
-        main.email_user(db, app_row.worker_user_id, "Payroll processed", "Your payroll record has been processed.", f"/hire/{application_id}")
+        main.email_user(db, app_row.worker_user_id, "Payroll processed", "Your payroll record has been processed.", payroll_link)
     elif action == "pay_payroll":
-        main.email_user(db, app_row.worker_user_id, "Payroll paid", "Your payroll record has been marked paid.", f"/hire/{application_id}")
+        main.email_user(db, app_row.worker_user_id, "Payroll paid", "Your payroll record has been marked paid.", payroll_link)
     elif action == "send_invoice":
-        main.email_user(db, app_row.contractor_user_id, "Invoice processed", "Your contractor invoice has been processed.", f"/hire/{application_id}")
+        main.email_user(db, app_row.contractor_user_id, "Invoice processed", "Your contractor invoice has been processed.", payroll_link)
     elif action == "pay_invoice":
-        main.email_user(db, app_row.contractor_user_id, "Invoice paid", "Your contractor invoice has been marked paid.", f"/hire/{application_id}")
+        main.email_user(db, app_row.contractor_user_id, "Invoice paid", "Your contractor invoice has been marked paid.", payroll_link)
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
 
 
@@ -666,7 +675,7 @@ def update_assignment(
         hire.assignment_status = "active"
         if not hire.actual_start_date:
             hire.actual_start_date = main.now_iso()[:10]
-        main.notify(db, app_row.worker_user_id, "Assignment started", "Your contractor marked your assignment as Active.")
+        main.notify(db, app_row.worker_user_id, "Assignment started", "Your contractor marked your assignment as Active.", f"/hire/{application_id}")
     elif action == "complete":
         if hire.assignment_status != "active":
             raise HTTPException(status_code=400, detail="Only an active assignment can be completed.")
@@ -676,7 +685,7 @@ def update_assignment(
             raise HTTPException(status_code=400, detail="Review and process all timesheets before completing the assignment.")
         hire.assignment_status = "completed"
         hire.completed_date = main.now_iso()[:10]
-        main.notify(db, app_row.worker_user_id, "Assignment completed", "Your contractor marked your assignment as completed.")
+        main.notify(db, app_row.worker_user_id, "Assignment completed", "Your contractor marked your assignment as completed.", f"/hire/{application_id}")
     else:
         raise HTTPException(status_code=400, detail="Unknown assignment action")
 
@@ -718,6 +727,6 @@ def save_compliance(application_id: int, request: Request, compliance_status: st
     hire.compliance_notes = compliance_notes.strip()[:4000]
     hire.compliance_verified_date = main.now_iso()[:10] if compliance_status == "verified" else ""
     hire.updated_at = main.now_iso()
-    main.notify(db, app_row.worker_user_id, "Compliance status updated", "Your assignment compliance status was updated.")
+    main.notify(db, app_row.worker_user_id, "Compliance status updated", "Your assignment compliance status was updated.", f"/hire/{application_id}")
     db.commit()
     return RedirectResponse(f"/hire/{application_id}", status_code=303)
