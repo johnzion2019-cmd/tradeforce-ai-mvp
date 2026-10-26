@@ -2,6 +2,7 @@
 
 Register with the FastAPI application from app.py. Secrets stay in environment variables.
 """
+import base64
 import html
 import os
 
@@ -67,6 +68,39 @@ def _hydrate_stripe_secrets_from_chunks():
         if missing:
             continue
         os.environ[target] = "".join(parts)
+    _hydrate_stripe_secrets_from_b64()
+
+
+def _hydrate_stripe_secrets_from_b64():
+    # Base64 chunks win over raw chunks and any truncated secret. Every part
+    # must be present. Do not log secret material.
+    for target, prefix in (
+        ("STRIPE_SECRET_KEY", "STRIPE_SK_B64"),
+        ("STRIPE_WEBHOOK_SECRET", "STRIPE_WH_B64"),
+    ):
+        raw_count = os.environ.get(f"{prefix}_COUNT")
+        if raw_count is None or raw_count.strip() == "":
+            continue
+        try:
+            count = int(raw_count)
+        except ValueError:
+            continue
+        if count <= 0:
+            continue
+        parts = []
+        missing = False
+        for index in range(count):
+            chunk_name = f"{prefix}_{index}"
+            if chunk_name not in os.environ:
+                missing = True
+                break
+            parts.append(os.environ[chunk_name])
+        if missing:
+            continue
+        try:
+            os.environ[target] = base64.b64decode("".join(parts)).decode()
+        except ValueError:
+            continue
 
 
 _hydrate_stripe_secrets_from_chunks()
@@ -150,6 +184,28 @@ button.secondary{{background:transparent;color:var(--text);border:1px solid var(
 </html>"""
 
 
+def _stripe_health_diagnostics():
+    secret = os.getenv("STRIPE_SECRET_KEY") or ""
+    webhook = os.getenv("STRIPE_WEBHOOK_SECRET") or ""
+    chunk_count = os.getenv("STRIPE_SK_CHUNK_COUNT")
+    chunks_present = 0
+    try:
+        count = int(chunk_count) if chunk_count is not None else 0
+    except ValueError:
+        count = 0
+    if count > 0:
+        chunks_present = sum(
+            1 for index in range(count) if f"STRIPE_SK_CHUNK_{index:02d}" in os.environ
+        )
+    return {
+        "stripe_secret_len": len(secret),
+        "stripe_webhook_len": len(webhook),
+        "stripe_sk_chunk_count": chunk_count,
+        "stripe_sk_chunks_present": chunks_present,
+        "stripe_secret_prefix": secret[:7] if secret else "",
+    }
+
+
 @router.get("/phase5/health")
 def phase5_health():
     return {
@@ -157,6 +213,7 @@ def phase5_health():
         "billing_module": "ready",
         "stripe_configured": stripe_ready(),
         "webhook_configured": bool(os.getenv("STRIPE_WEBHOOK_SECRET")),
+        **_stripe_health_diagnostics(),
     }
 
 
