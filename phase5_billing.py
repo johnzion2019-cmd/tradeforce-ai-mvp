@@ -39,6 +39,39 @@ class Subscription(BillingBase):
 BillingBase.metadata.create_all(bind=engine)
 
 
+def _hydrate_stripe_secrets_from_chunks():
+    # Render env-size/truncation workaround: full secrets are stored as short
+    # chunks and must replace any truncated STRIPE_SECRET_KEY /
+    # STRIPE_WEBHOOK_SECRET. Remove once those secrets are set normally.
+    for target, prefix in (
+        ("STRIPE_SECRET_KEY", "STRIPE_SK_CHUNK"),
+        ("STRIPE_WEBHOOK_SECRET", "STRIPE_WH_CHUNK"),
+    ):
+        raw_count = os.environ.get(f"{prefix}_COUNT")
+        if raw_count is None or raw_count.strip() == "":
+            continue
+        try:
+            count = int(raw_count)
+        except ValueError:
+            continue
+        if count <= 0:
+            continue
+        parts = []
+        missing = False
+        for index in range(count):
+            chunk_name = f"{prefix}_{index:02d}"
+            if chunk_name not in os.environ:
+                missing = True
+                break
+            parts.append(os.environ[chunk_name])
+        if missing:
+            continue
+        os.environ[target] = "".join(parts)
+
+
+_hydrate_stripe_secrets_from_chunks()
+
+
 def stripe_ready():
     return bool(
         os.getenv("STRIPE_SECRET_KEY")
