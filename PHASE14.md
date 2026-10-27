@@ -66,7 +66,7 @@ When all three required variables are set, `/health` and `/phase14/health` repor
 ## Verify locally
 
 ```bash
-pip install -r requirements.txt pytest
+pip install -r requirements.txt pytest httpx
 pytest tests/test_phase14_hardening.py tests/test_phase5_billing.py
 ```
 
