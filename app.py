@@ -2,19 +2,22 @@
 import html
 import os
 import re
+import secrets
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import main
 from account_security import _send_email, router as account_security_router
 from fastapi import Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from legal_routes import router as legal_router
 from main import app
 from phase5_billing import router as billing_router
 from phase6_onboarding import init_phase6, onboarding_progress, hire_for_application, router as phase6_router
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 
 MAX_UPLOAD_REQUEST_BYTES = 12 * 1024 * 1024
@@ -27,18 +30,39 @@ ALLOWED_UPLOADS = {
     ".png": {"image/png"},
 }
 
-# Lightweight per-instance rate limiting for the MVP. This protects high-risk
+# Lightweight per-process rate limiting for the MVP. This protects high-risk
 # endpoints from basic abuse without introducing another paid dependency.
+# Buckets are not shared across instances. Run a single instance, or move these
+# counters to a shared store such as Redis before scaling horizontally.
 _RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 RATE_LIMITS = {
     "login": (10, 300),       # 10 attempts / 5 minutes / client
-    "signup": (5, 3600),      # 5 account creations / hour / client
+    "signup": (5, 3600),      # 5 registrations / hour / client
+    "forgot": (5, 900),       # 5 password-reset requests / 15 minutes / client
+    "reset": (5, 900),        # 5 password resets / 15 minutes / client
+    "checkout": (10, 600),    # 10 Stripe Checkout creates / 10 minutes / client
+    "portal": (10, 600),      # 10 Customer Portal creates / 10 minutes / client
     "message": (30, 60),      # 30 message writes / minute / client
     "job": (20, 60),          # 20 job mutations / minute / client
     "apply": (30, 60),        # 30 application writes / minute / client
     "admin_reset": (10, 300), # 10 token attempts / 5 minutes / client
     "mutation": (120, 60),    # fallback for other state-changing requests
 }
+
+# Signed Stripe webhooks and the header-authenticated admin reset are not browser
+# form posts. They authenticate themselves and must not require a CSRF token.
+CSRF_EXEMPT_PATHS = frozenset({
+    "/stripe/webhook",
+    "/phase5/admin/reset-subscription",
+})
+_POST_FORM_RE = re.compile(
+    r"<form\b[^>]*\bmethod\s*=\s*(?P<q>['\"]?)post(?P=q)[^>]*>",
+    re.IGNORECASE,
+)
+_MULTIPART_CSRF_RE = re.compile(
+    br"""Content-Disposition:[^\r\n]*\bname=(?:"csrf_token"|'csrf_token')[^\r\n]*\r\n(?:[^\r\n]+\r\n)*\r\n([^\r\n]*)""",
+    re.IGNORECASE,
+)
 
 
 def quarantine_legacy_unowned_jobs() -> None:
@@ -136,6 +160,14 @@ def _rate_class(request: Request) -> str:
         return "login"
     if path == "/signup":
         return "signup"
+    if path == "/forgot-password":
+        return "forgot"
+    if path == "/reset-password":
+        return "reset"
+    if path.startswith("/billing/checkout/"):
+        return "checkout"
+    if path == "/billing/portal":
+        return "portal"
     if path.startswith("/messages") or path.startswith("/message"):
         return "message"
     if path.startswith("/contractor/job"):
@@ -271,6 +303,103 @@ main.templates.env.globals["hire_for_application"] = hire_for_application
 main.templates.env.globals["onboarding_progress"] = onboarding_progress
 
 
+def _with_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
+
+
+def _csrf_applies(path: str) -> bool:
+    return path not in CSRF_EXEMPT_PATHS and not path.startswith("/static")
+
+
+def _ensure_csrf_token(request: Request) -> str:
+    """Return the session synchronizer token, creating one when the session has none."""
+    token = request.session.get("csrf_token")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
+
+
+def _tokens_match(expected: str, provided: str) -> bool:
+    if not expected or not provided:
+        return False
+    expected_b = expected.encode("utf-8")
+    provided_b = provided.encode("utf-8")
+    if len(expected_b) != len(provided_b):
+        return False
+    return secrets.compare_digest(expected_b, provided_b)
+
+
+def _csrf_token_from_body(content_type: str, body: bytes) -> str:
+    """Pull the form field without parsing JSON bodies used by non-browser clients."""
+    if not body:
+        return ""
+    ctype = (content_type or "").lower()
+    if "application/json" in ctype:
+        return ""
+    if "multipart/form-data" in ctype:
+        match = _MULTIPART_CSRF_RE.search(body)
+        return match.group(1).decode("utf-8", "ignore").strip() if match else ""
+    text = body.decode("utf-8", "ignore")
+    values = parse_qs(text, keep_blank_values=True, max_num_fields=100).get("csrf_token", [])
+    return values[0] if values else ""
+
+
+def _inject_csrf_into_html(html_text: str, token: str) -> str:
+    safe = html.escape(token, quote=True)
+    hidden = f'<input type="hidden" name="csrf_token" value="{safe}">'
+
+    def repl(match: re.Match) -> str:
+        window = html_text[match.end():match.end() + 180].lower()
+        if "csrf_token" in window:
+            return match.group(0)
+        return match.group(0) + hidden
+
+    return _POST_FORM_RE.sub(repl, html_text)
+
+
+async def _response_with_csrf(response, token: str):
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type.lower():
+        return response
+    payload = b"".join([chunk async for chunk in response.body_iterator])
+    updated = _inject_csrf_into_html(payload.decode("utf-8", "replace"), token)
+    headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
+    return HTMLResponse(updated, status_code=response.status_code, headers=headers)
+
+
+async def csrf_protect(request: Request, call_next):
+    """Require the session CSRF token on cookie-authenticated form posts.
+
+    This middleware is registered inside SessionMiddleware so the token is saved
+    in the session cookie before the response is sent. HTML form tags are given
+    a matching hidden field on the way out.
+    """
+    if not _csrf_applies(request.url.path):
+        return await call_next(request)
+
+    token = _ensure_csrf_token(request)
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        provided = request.headers.get("x-csrf-token", "")
+        content_type = request.headers.get("content-type", "")
+        if not provided and "application/json" not in content_type.lower():
+            body = await request.body()
+            provided = _csrf_token_from_body(content_type, body)
+        if not _tokens_match(token, provided):
+            return PlainTextResponse(
+                "CSRF validation failed. Refresh the page and submit the form again.",
+                status_code=403,
+            )
+
+    response = await call_next(request)
+    return await _response_with_csrf(response, token)
+
+
 quarantine_legacy_unowned_jobs()
 init_phase6()
 app.include_router(billing_router)
@@ -290,15 +419,15 @@ async def production_security(request: Request, call_next):
             referer = request.headers.get("referer")
             source_host = urlparse(origin).netloc if origin else (urlparse(referer).netloc if referer else "")
             if source_host and source_host != expected_host:
-                return PlainTextResponse("Cross-site request blocked.", status_code=403)
+                return _with_security_headers(PlainTextResponse("Cross-site request blocked.", status_code=403))
 
         blocked, retry_after = _rate_limited(request)
         if blocked:
-            return PlainTextResponse(
-                "Too many requests. Please try again shortly.",
+            return _with_security_headers(PlainTextResponse(
+                f"Too many requests. Please wait {retry_after} seconds and try again.",
                 status_code=429,
                 headers={"Retry-After": str(retry_after)},
-            )
+            ))
 
     if request.method == "POST" and request.url.path == "/worker/profile":
         content_type = request.headers.get("content-type", "")
@@ -306,7 +435,7 @@ async def production_security(request: Request, call_next):
             body = await request.body()
             error = validate_worker_uploads(content_type, body)
             if error:
-                return PlainTextResponse(error, status_code=400)
+                return _with_security_headers(PlainTextResponse(error, status_code=400))
 
             sent = False
 
@@ -330,12 +459,26 @@ async def production_security(request: Request, call_next):
             # Email confirmation must never turn a successful job posting into an error.
             pass
 
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000"
-    return response
+    return _with_security_headers(response)
+
+
+# SessionMiddleware is already on the stack. Append CSRF so it runs inside that
+# middleware: the token is written to the session before the cookie is signed.
+app.user_middleware.append(Middleware(BaseHTTPMiddleware, dispatch=csrf_protect))
+main.CSRF_PROTECTION = "enabled"
+main.RATE_LIMIT = "in-memory"
+
+
+@app.get("/phase14/health")
+def phase14_health():
+    """Safe launch-hardening flags. Does not read secrets or contact object storage."""
+    return {
+        "phase": 14,
+        "csrf": main.CSRF_PROTECTION,
+        "rate_limit": main.RATE_LIMIT,
+        "rate_limit_scope": "per-process",
+        "document_storage": "object-storage" if main.storage_enabled() else "database-fallback",
+    }
 
 
 @app.post("/job/{job_id}/reopen")
@@ -356,7 +499,7 @@ def reopen_job(job_id: int, request: main.Request, db: main.Session = main.Depen
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
-@app.api_route("/application/{application_id}/offer/accept", methods=["GET", "POST"])
+@app.post("/application/{application_id}/offer/accept")
 def accept_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
     """Allow the worker who owns an application to accept a contractor offer."""
     user = main.require_user(request, db, "worker")
@@ -398,7 +541,7 @@ def accept_offer(application_id: int, request: main.Request, db: main.Session = 
     return main.RedirectResponse("/dashboard", status_code=303)
 
 
-@app.api_route("/application/{application_id}/offer/decline", methods=["GET", "POST"])
+@app.post("/application/{application_id}/offer/decline")
 def decline_offer(application_id: int, request: main.Request, db: main.Session = main.Depends(main.get_db)):
     """Allow the worker who owns an application to decline a contractor offer."""
     user = main.require_user(request, db, "worker")

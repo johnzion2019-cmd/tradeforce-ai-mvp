@@ -872,11 +872,31 @@ def admin_job_status(job_id: int, new_status: str = Form(...), _: str = Depends(
     job.status = new_status; db.commit(); return RedirectResponse("/admin", status_code=303)
 
 
+# app.py turns these on when the production middleware stack is installed.
+# Importing main.py alone leaves them disabled so /health does not claim protections that are not running.
+CSRF_PROTECTION = "disabled"
+RATE_LIMIT = "disabled"
+
+
 @app.get("/health")
 def health():
     try:
         with engine.connect() as conn: conn.execute(text("SELECT 1"))
         database = "postgresql" if engine.dialect.name == "postgresql" else "sqlite"
-        return {"status": "ok", "service": "TradeForce AI", "database": database, "phase": 13, "document_storage": "object-storage" if storage_enabled() else "database-fallback", "features": ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search"]}
+        features = ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search"]
+        if CSRF_PROTECTION == "enabled":
+            features.append("csrf")
+        if RATE_LIMIT != "disabled":
+            features.append("rate-limit")
+        return {
+            "status": "ok",
+            "service": "TradeForce AI",
+            "database": database,
+            "phase": 14,
+            "document_storage": "object-storage" if storage_enabled() else "database-fallback",
+            "csrf": CSRF_PROTECTION,
+            "rate_limit": RATE_LIMIT,
+            "features": features,
+        }
     except Exception:
         raise HTTPException(status_code=503, detail="Database unavailable")
