@@ -306,10 +306,20 @@ class AdminResetSubscriptionTests(unittest.TestCase):
         with phase5_billing.engine.begin() as conn:
             conn.execute(text("DELETE FROM subscriptions WHERE user_id = :user_id"), {"user_id": user_id})
             conn.execute(text("DELETE FROM account_users WHERE id = :user_id OR email = :email"), {"user_id": user_id, "email": email})
-            conn.execute(
-                text("INSERT INTO account_users (id, email, role) VALUES (:user_id, :email, :role)"),
-                {"user_id": user_id, "email": email, "role": role},
-            )
+            columns = {row[1] for row in conn.execute(text("PRAGMA table_info(account_users)"))}
+            params = {"user_id": user_id, "email": email, "role": role}
+            if "password_hash" in columns:
+                # The full app schema requires a hash. The standalone billing schema does not.
+                params["password_hash"] = "test-hash"
+                conn.execute(
+                    text("INSERT INTO account_users (id, email, role, password_hash) VALUES (:user_id, :email, :role, :password_hash)"),
+                    params,
+                )
+            else:
+                conn.execute(
+                    text("INSERT INTO account_users (id, email, role) VALUES (:user_id, :email, :role)"),
+                    params,
+                )
             if with_subscription:
                 conn.execute(
                     text(
