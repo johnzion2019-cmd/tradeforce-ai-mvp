@@ -27,7 +27,7 @@ Required production variables:
 
 Before accepting real payments: rotate the existing admin password, set a dedicated SESSION_SECRET, configure Stripe in test mode first, configure and test the webhook endpoint, verify cancellation/renewal flows, add Terms of Service and Privacy Policy, and run end-to-end worker/contractor/billing tests.
 
-Phase 14 adds CSRF protection and per-process rate limiting for cookie-authenticated form posts, and documents durable object storage. See PHASE14.md. `/health` reports `phase`, `document_storage`, `csrf`, and `rate_limit`.
+Phase 14 adds CSRF protection and per-process rate limiting for cookie-authenticated form posts, and documents durable object storage. See PHASE14.md. `/health` reports `phase`, `document_storage`, `csrf`, and `rate_limit`. Phase 15 adds the saved-candidates workspace and moves `/health` to `phase: 15`. See PHASE15.md.
 
 ## Revenue model
 
