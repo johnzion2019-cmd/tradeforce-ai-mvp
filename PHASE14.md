@@ -2,7 +2,7 @@
 
 Phase 14 hardens the production app for launch. It does not change Stripe price IDs, billing flows, or Phase 13 notifications.
 
-The production entrypoint remains `phase6_app:app` (which loads `app.py`). That module installs CSRF protection and rate limiting. When Phase 14 shipped, `/health` reported `phase: 14`. Phase 15 advances that shared field to `15` and adds `saved-workspace`. `GET /phase14/health` still reports `phase: 14`.
+The production entrypoint remains `phase6_app:app` (which loads `app.py`). That module installs CSRF protection and rate limiting. When Phase 14 shipped, `/health` reported `phase: 14`. Later phases advance that shared field. Phase 16 sets it to `16` and adds `pro-gating`. `GET /phase14/health` still reports `phase: 14`.
 
 ## CSRF
 
@@ -61,7 +61,7 @@ When all three required variables are set, `/health` and `/phase14/health` repor
 - `rate_limit`: `in-memory` when the production app is loaded
 - `rate_limit_scope`: `per-process`
 
-`GET /health` (database check) keeps those storage, CSRF, and rate-limit fields. Phase 15 sets its `phase` to `15` and adds `saved-workspace` to `features`. `/health` still includes `csrf` and `rate-limit` when the production app is loaded.
+`GET /health` (database check) keeps those storage, CSRF, and rate-limit fields. Phase 16 sets its `phase` to `16` and includes `saved-workspace` and `pro-gating` in `features`. `/health` still includes `csrf` and `rate-limit` when the production app is loaded.
 
 ## Verify locally
 

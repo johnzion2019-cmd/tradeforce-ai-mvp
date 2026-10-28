@@ -290,12 +290,12 @@ class HealthTests(Phase14Case):
 
         self.assertEqual(health.status_code, 200)
         body = health.json()
-        self.assertEqual(body["phase"], 15)
+        self.assertEqual(body["phase"], 16)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["document_storage"], "database-fallback")
         self.assertEqual(body["csrf"], "enabled")
         self.assertEqual(body["rate_limit"], "in-memory")
-        for feature in ("messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search", "saved-workspace", "csrf", "rate-limit"):
+        for feature in ("messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search", "saved-workspace", "pro-gating", "csrf", "rate-limit"):
             self.assertIn(feature, body["features"])
 
         self.assertEqual(phase.status_code, 200)

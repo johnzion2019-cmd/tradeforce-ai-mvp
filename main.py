@@ -18,6 +18,9 @@ from sqlalchemy import Boolean, Column, ForeignKey, Integer, LargeBinary, String
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from starlette.middleware.sessions import SessionMiddleware
 
+import phase5_billing
+from phase5_billing import has_active_paid_subscription
+
 app = FastAPI(title="TradeForce AI")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
@@ -204,6 +207,9 @@ def migrate_existing_tables(bind=None):
 
 
 migrate_existing_tables()
+# Same subscriptions table Phase 5 webhooks write. Bind it to this engine so
+# entitlement checks read the app database rather than calling Stripe.
+phase5_billing.BillingBase.metadata.create_all(bind=engine)
 
 
 def get_db():
@@ -404,8 +410,96 @@ def nav_unread(request: Request, kind: str) -> int:
 
 SAVED_LABELS = ("Top pick", "Follow up", "Maybe", "Not now")
 SAVED_NOTE_LIMIT = 1000
+UPGRADE_COPY = {
+    "saved": {
+        "title": "Saved candidates are included with Pro",
+        "message": "Starter includes job posting and basic talent search. An active Pro or Business plan unlocks the saved-candidates workspace, private notes and labels, and the Saved only filter.",
+    },
+    "messages": {
+        "title": "Contractor messaging is included with Pro",
+        "message": "Starter includes job posting, invitations, and the hiring pipeline. An active Pro or Business plan unlocks the contractor messaging inbox. Workers can still message you about an application, invitation, or hire.",
+    },
+}
+
+
+def contractor_pro_entitled(db: Session, user: Optional[UserAccount]) -> bool:
+    """Active Pro or Business from the Phase 5 subscriptions row.
+
+    Session role "admin" is allowed through so an admin account is not locked
+    out of contractor tools. HTTP Basic /admin routes do not use this check.
+    Workers are never contractor-entitled. No Stripe request is made.
+    """
+    if not user:
+        return False
+    role = (user.role or "").strip().lower()
+    if role == "admin":
+        return True
+    if role != "contractor":
+        return False
+    row = db.execute(
+        text("SELECT plan, status FROM subscriptions WHERE user_id = :user_id"),
+        {"user_id": user.id},
+    ).first()
+    return has_active_paid_subscription(row)
+
+
+def bind_contractor_pro(request: Request, db: Session, user: UserAccount) -> bool:
+    entitled = contractor_pro_entitled(db, user)
+    try:
+        request.state.contractor_has_pro = entitled
+    except Exception:
+        pass
+    return entitled
+
+
+def contractor_has_pro(request: Request) -> bool:
+    """Template helper. Reuses the value bound during the request when present."""
+    cached = getattr(request.state, "contractor_has_pro", None)
+    if cached is not None:
+        return bool(cached)
+    entitled = False
+    user_id = request.session.get("user_id")
+    if user_id:
+        db = SessionLocal()
+        try:
+            user = db.query(UserAccount).filter(UserAccount.id == user_id).first()
+            entitled = contractor_pro_entitled(db, user)
+        finally:
+            db.close()
+    try:
+        request.state.contractor_has_pro = entitled
+    except Exception:
+        pass
+    return entitled
+
+
+def upgrade_feature(feature: Optional[str]) -> str:
+    value = (feature or "").strip().lower()
+    return value if value in UPGRADE_COPY else "saved"
+
+
+def render_upgrade(request: Request, user: UserAccount, feature: Optional[str]):
+    key = upgrade_feature(feature)
+    copy = UPGRADE_COPY[key]
+    return templates.TemplateResponse(
+        "upgrade.html",
+        {
+            "request": request,
+            "user": user,
+            "upgrade_title": copy["title"],
+            "upgrade_message": copy["message"],
+            "upgrade_feature": key,
+        },
+    )
+
+
+def pro_upgrade_redirect(feature: str):
+    return RedirectResponse("/upgrade?feature=" + upgrade_feature(feature), status_code=303)
+
+
 templates.env.globals["nav_unread"] = nav_unread
 templates.env.globals["saved_labels"] = SAVED_LABELS
+templates.env.globals["contractor_has_pro"] = contractor_has_pro
 
 
 def notification_return_path(request: Request) -> str:
@@ -561,6 +655,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         applications_by_job.setdefault(a.job_id, []).append({"application": a, "worker": worker_lookup.get(a.worker_id)})
     favorite_ids = {row.worker_id for row in db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).all()}
     company_profile = db.query(CompanyProfile).filter(CompanyProfile.user_id == user.id).first()
+    bind_contractor_pro(request, db, user)
     return templates.TemplateResponse("contractor_dashboard.html", {"request": request, "user": user, "jobs": jobs, "matches": matches, "notifications": notifications, "applications_by_job": applications_by_job, "favorite_ids": favorite_ids, "company_profile": company_profile})
 
 
@@ -753,12 +848,27 @@ def contractor_open_jobs(db: Session, user_id: int):
     return db.query(ManpowerRequest).filter(ManpowerRequest.user_id == user_id, ManpowerRequest.status == "open").order_by(ManpowerRequest.id.desc()).all()
 
 
+@app.get("/upgrade", response_class=HTMLResponse)
+def upgrade_page(request: Request, feature: str = "saved", db: Session = Depends(get_db)):
+    user = require_user(request, db, "contractor")
+    key = upgrade_feature(feature)
+    if bind_contractor_pro(request, db, user):
+        destination = "/messages" if key == "messages" else "/saved"
+        return RedirectResponse(destination, status_code=303)
+    return render_upgrade(request, user, key)
+
+
 @app.get("/talent", response_class=HTMLResponse)
 def talent_search(request: Request, trade: str = "", location: str = "", min_experience: int = 0, favorites: str = "", db: Session = Depends(get_db)):
     user = require_user(request, db, "contractor")
+    entitled = bind_contractor_pro(request, db, user)
+    if favorites == "yes" and not entitled:
+        return render_upgrade(request, user, "saved")
     favorite_rows = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).all()
     favorite_ids = {row.worker_id for row in favorite_rows}
-    favorite_labels = {row.worker_id: row.label for row in favorite_rows if (row.label or "").strip()}
+    favorite_labels = {}
+    if entitled:
+        favorite_labels = {row.worker_id: row.label for row in favorite_rows if (row.label or "").strip()}
     if favorites == "yes":
         query = db.query(Worker).filter(Worker.id.in_(favorite_ids or [-1]))
     else:
@@ -777,6 +887,8 @@ def talent_search(request: Request, trade: str = "", location: str = "", min_exp
 @app.get("/saved", response_class=HTMLResponse)
 def saved_candidates(request: Request, label: str = "", trade: str = "", db: Session = Depends(get_db)):
     user = require_user(request, db, "contractor")
+    if not bind_contractor_pro(request, db, user):
+        return render_upgrade(request, user, "saved")
     label_filter = (label or "").strip()
     trade_filter = (trade or "").strip()
     favorites = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).order_by(FavoriteCandidate.created_at.desc(), FavoriteCandidate.id.desc()).all()
@@ -799,6 +911,8 @@ def saved_candidates(request: Request, label: str = "", trade: str = "", db: Ses
 @app.post("/saved/{worker_id}")
 def update_saved_candidate(worker_id: int, request: Request, note: str = Form(""), label: str = Form(""), return_to: str = Form(""), db: Session = Depends(get_db)):
     user = require_user(request, db, "contractor")
+    if not contractor_pro_entitled(db, user):
+        return pro_upgrade_redirect("saved")
     favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
     if not favorite:
         raise HTTPException(status_code=404, detail="Saved candidate not found")
@@ -820,6 +934,8 @@ def toggle_favorite(worker_id: int, request: Request, return_to: str = Form(""),
     favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
     if favorite:
         db.delete(favorite)
+    elif not contractor_pro_entitled(db, user):
+        return pro_upgrade_redirect("saved")
     else:
         db.add(FavoriteCandidate(contractor_user_id=user.id, worker_id=worker_id))
     db.commit()
@@ -849,9 +965,10 @@ def worker_profile_page(worker_id: int, request: Request, db: Session = Depends(
     user = require_user(request, db, "contractor")
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker: raise HTTPException(status_code=404, detail="Worker not found")
+    entitled = bind_contractor_pro(request, db, user)
     favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
     relationship = can_message(db, user.id, worker.user_id) if worker.user_id else None
-    return templates.TemplateResponse("worker_profile.html", {"request": request, "user": user, "worker": worker, "favorite": bool(favorite), "saved": favorite, "relationship": relationship})
+    return templates.TemplateResponse("worker_profile.html", {"request": request, "user": user, "worker": worker, "favorite": bool(favorite), "saved": favorite if entitled else None, "relationship": relationship})
 
 
 @app.get("/contractor/worker/{worker_id}/document/{kind}")
@@ -866,6 +983,8 @@ def contractor_document(worker_id: int, kind: str, request: Request, db: Session
 @app.get("/messages", response_class=HTMLResponse)
 def messages_page(request: Request, with_user: int = 0, db: Session = Depends(get_db)):
     user = require_user(request, db)
+    if user.role == "contractor" and not bind_contractor_pro(request, db, user):
+        return render_upgrade(request, user, "messages")
     messages = db.query(Message).filter(or_(Message.sender_user_id == user.id, Message.recipient_user_id == user.id)).order_by(Message.id.desc()).limit(200).all()
     partner_ids = []; seen = set()
     for m in messages:
@@ -896,6 +1015,8 @@ def messages_page(request: Request, with_user: int = 0, db: Session = Depends(ge
 @app.post("/messages/send/{recipient_id}")
 def send_message(recipient_id: int, request: Request, body: str = Form(...), db: Session = Depends(get_db)):
     user = require_user(request, db)
+    if user.role == "contractor" and not contractor_pro_entitled(db, user):
+        return pro_upgrade_redirect("messages")
     recipient = db.query(UserAccount).filter(UserAccount.id == recipient_id).first()
     if not recipient or recipient.id == user.id: raise HTTPException(status_code=404, detail="Recipient not found")
     relationship = can_message(db, user.id, recipient_id)
@@ -992,7 +1113,7 @@ def health():
     try:
         with engine.connect() as conn: conn.execute(text("SELECT 1"))
         database = "postgresql" if engine.dialect.name == "postgresql" else "sqlite"
-        features = ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search", "saved-workspace"]
+        features = ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search", "saved-workspace", "pro-gating"]
         if CSRF_PROTECTION == "enabled":
             features.append("csrf")
         if RATE_LIMIT != "disabled":
@@ -1001,7 +1122,7 @@ def health():
             "status": "ok",
             "service": "TradeForce AI",
             "database": database,
-            "phase": 15,
+            "phase": 16,
             "document_storage": "object-storage" if storage_enabled() else "database-fallback",
             "csrf": CSRF_PROTECTION,
             "rate_limit": RATE_LIMIT,

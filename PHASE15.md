@@ -1,8 +1,8 @@
 # TradeForce AI — Phase 15
 
-Phase 15 finishes the saved-candidates workspace for contractors. It does not change Stripe billing, S3/R2 document storage, Redis, or Pro-plan gating.
+Phase 15 finishes the saved-candidates workspace for contractors. It does not change Stripe billing, S3/R2 document storage, or Redis. Phase 16 now gates this workspace behind an active Pro or Business subscription. See PHASE16.md.
 
-The production entrypoint remains `phase6_app:app` (which loads `app.py`). Phase 14 CSRF protection and rate limits still apply to every new form post. `/health` reports `phase: 15`.
+The production entrypoint remains `phase6_app:app` (which loads `app.py`). Phase 14 CSRF protection and rate limits still apply to every new form post. `/health` reports `phase: 16`.
 
 ## Saved workspace
 
@@ -55,8 +55,8 @@ New post forms rely on the Phase 14 session CSRF token. `POST /saved/{worker_id}
 
 `GET /health` includes:
 
-- `phase`: `15`
-- `features`: the existing list, plus `saved-workspace`, and `csrf` / `rate-limit` when the production app is loaded
+- `phase`: `16` (Phase 16 moved this shared field and added `pro-gating`)
+- `features`: the existing list, plus `saved-workspace` and `pro-gating`, and `csrf` / `rate-limit` when the production app is loaded
 
 `GET /phase14/health` is unchanged and still reports `phase: 14`.
 
@@ -74,4 +74,4 @@ uvicorn phase6_app:app --host 0.0.0.0 --port 8000
 curl -s localhost:8000/health
 ```
 
-The JSON `phase` field is `15` and `features` includes `saved-workspace`.
+The JSON `phase` field is `16` and `features` includes `saved-workspace` and `pro-gating`.
