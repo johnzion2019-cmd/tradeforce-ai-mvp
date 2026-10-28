@@ -1,0 +1,18 @@
+{% extends 'base.html' %}
+{% block title %}Upgrade · TradeForce AI{% endblock %}
+{% block content %}
+<section class='formwrap authcard'>
+  <p class='eyebrow'>PHASE 16 · PRO PLAN</p>
+  <h1>{{upgrade_title}}</h1>
+  <p class='muted'>{{upgrade_message}}</p>
+  <p>Pro and Business are managed on the billing page. Starter stays on job posting, talent search, invitations, and the hiring pipeline.</p>
+  <div class='actions'>
+    <a class='btn' href='/billing'>Upgrade on the billing page</a>
+    {% if upgrade_feature == 'messages' %}
+    <a class='btn secondary' href='/dashboard'>Back to dashboard</a>
+    {% else %}
+    <a class='btn secondary' href='/talent'>Back to talent search</a>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

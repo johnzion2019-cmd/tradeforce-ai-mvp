@@ -143,6 +143,18 @@ def subscription_plan_status(sub):
     return plan, status
 
 
+def has_active_paid_subscription(sub) -> bool:
+    """True when the stored row is an active Pro or Business plan.
+
+    Uses plan and status already saved on the subscriptions table. Callers
+    must not hit Stripe on each page view; webhooks keep this row current.
+    Only status "active" counts. Trialing, past_due, canceled, and inactive
+    stay on the Starter feature set. A missing row is Starter / inactive.
+    """
+    plan, status = subscription_plan_status(sub)
+    return status == "active" and plan in {"pro", "business"}
+
+
 def upgrade_cta_visible(sub):
     """Which checkout CTAs the billing page should offer.
 
@@ -150,8 +162,8 @@ def upgrade_cta_visible(sub):
     Business subscription is the top plan, so neither checkout CTA is shown.
     Starter and any non-active status keep both upgrades.
     """
-    plan, status = subscription_plan_status(sub)
-    on_active_paid_plan = status == "active" and plan in {"pro", "business"}
+    plan, _status = subscription_plan_status(sub)
+    on_active_paid_plan = has_active_paid_subscription(sub)
     return {
         "pro": not on_active_paid_plan,
         "business": not (on_active_paid_plan and plan == "business"),

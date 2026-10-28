@@ -54,9 +54,28 @@ class Phase15Case(unittest.TestCase):
         self.assertEqual(response.status_code, 303, response.text[:300])
         return client
 
+    def _activate_plan(self, email, plan="pro", status="active"):
+        """Phase 16 gates the saved workspace. These tests cover entitled contractors."""
+        db = main.SessionLocal()
+        try:
+            user = db.query(main.UserAccount).filter(main.UserAccount.email == email).one()
+            db.execute(text("DELETE FROM subscriptions WHERE user_id = :user_id"), {"user_id": user.id})
+            db.execute(
+                text(
+                    "INSERT INTO subscriptions (user_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end) "
+                    "VALUES (:user_id, :plan, :status, '', '', '')"
+                ),
+                {"user_id": user.id, "plan": plan, "status": status},
+            )
+            db.commit()
+        finally:
+            db.close()
+
     def _contractor(self, email):
         headers = self._headers()
-        return self._signup(_browser(), email, "contractor", headers), headers
+        client = self._signup(_browser(), email, "contractor", headers)
+        self._activate_plan(email)
+        return client, headers
 
     def _worker(self, email, name, trade, location="Houston, TX", experience="8", desired_pay="$42/hr"):
         headers = self._headers()
@@ -446,8 +465,9 @@ class SavedWorkspaceTests(Phase15Case):
         health = self.client.get("/health")
         self.assertEqual(health.status_code, 200)
         body = health.json()
-        self.assertEqual(body["phase"], 15)
+        self.assertEqual(body["phase"], 16)
         self.assertIn("saved-workspace", body["features"])
+        self.assertIn("pro-gating", body["features"])
         self.assertIn("csrf", body["features"])
         self.assertIn("rate-limit", body["features"])
         phase14 = self.client.get("/phase14/health")
