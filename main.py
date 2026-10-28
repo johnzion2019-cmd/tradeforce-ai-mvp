@@ -5,7 +5,7 @@ import secrets
 import uuid
 from datetime import datetime
 from typing import Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -142,6 +142,8 @@ class FavoriteCandidate(Base):
     contractor_user_id = Column(Integer, ForeignKey("account_users.id"), nullable=False, index=True)
     worker_id = Column(Integer, ForeignKey("workers.id"), nullable=False, index=True)
     created_at = Column(String(40), default=now_iso)
+    note = Column(Text, default="")
+    label = Column(String(40), default="")
 
 
 class Message(Base):
@@ -158,9 +160,10 @@ class Message(Base):
 Base.metadata.create_all(bind=engine)
 
 
-def migrate_existing_tables():
-    inspector = inspect(engine)
-    dialect = engine.dialect.name
+def migrate_existing_tables(bind=None):
+    target = bind or engine
+    inspector = inspect(target)
+    dialect = target.dialect.name
     binary = "BYTEA" if dialect == "postgresql" else "BLOB"
     bool_true = "BOOLEAN DEFAULT TRUE" if dialect != "sqlite" else "INTEGER DEFAULT 1"
     migrations = {
@@ -185,8 +188,12 @@ def migrate_existing_tables():
         "notifications": {
             "link": "TEXT DEFAULT ''",
         },
+        "favorite_candidates": {
+            "note": "TEXT DEFAULT ''",
+            "label": "TEXT DEFAULT ''",
+        },
     }
-    with engine.begin() as conn:
+    with target.begin() as conn:
         for table_name, columns in migrations.items():
             if table_name not in inspector.get_table_names():
                 continue
@@ -395,7 +402,10 @@ def nav_unread(request: Request, kind: str) -> int:
         return 0
 
 
+SAVED_LABELS = ("Top pick", "Follow up", "Maybe", "Not now")
+SAVED_NOTE_LIMIT = 1000
 templates.env.globals["nav_unread"] = nav_unread
+templates.env.globals["saved_labels"] = SAVED_LABELS
 
 
 def notification_return_path(request: Request) -> str:
@@ -692,30 +702,129 @@ def opportunities(request: Request, trade: str = "", location: str = "", db: Ses
     return templates.TemplateResponse("opportunities.html", {"request": request, "user": user, "worker": worker, "rows": rows, "trade_filter": trade, "location_filter": location})
 
 
+def safe_app_path(value: Optional[str]) -> str:
+    """Keep form redirects on this app. Rejects off-site and protocol-relative URLs."""
+    if value is None:
+        return ""
+    candidate = str(value).strip()
+    if not candidate or len(candidate) > 500 or not candidate.startswith("/") or candidate.startswith("//"):
+        return ""
+    if any(ch in candidate for ch in ("\r", "\n", "\x00", "\\")) or ".." in candidate:
+        return ""
+    lowered = candidate.lower()
+    if "javascript:" in lowered or "data:" in lowered or "://" in candidate:
+        return ""
+    parsed = urlparse(candidate)
+    if parsed.scheme or parsed.netloc:
+        return ""
+    return candidate
+
+
+def normalize_saved_label(label: str) -> str:
+    value = (label or "").strip()
+    if value and value not in SAVED_LABELS:
+        raise HTTPException(status_code=400, detail="Choose a label from the list.")
+    return value
+
+
+def normalize_saved_note(note: str) -> str:
+    return (note or "").strip()[:SAVED_NOTE_LIMIT]
+
+
+def saved_note_preview(note: Optional[str], limit: int = 160) -> str:
+    text_value = (note or "").strip()
+    if len(text_value) <= limit:
+        return text_value
+    return text_value[: limit - 3].rstrip() + "..."
+
+
+def saved_return_path(label: str, trade: str) -> str:
+    params = {}
+    if label:
+        params["label"] = label
+    if trade:
+        params["trade"] = trade
+    if not params:
+        return "/saved"
+    return "/saved?" + urlencode(params)
+
+
+def contractor_open_jobs(db: Session, user_id: int):
+    return db.query(ManpowerRequest).filter(ManpowerRequest.user_id == user_id, ManpowerRequest.status == "open").order_by(ManpowerRequest.id.desc()).all()
+
+
 @app.get("/talent", response_class=HTMLResponse)
 def talent_search(request: Request, trade: str = "", location: str = "", min_experience: int = 0, favorites: str = "", db: Session = Depends(get_db)):
     user = require_user(request, db, "contractor")
-    query = db.query(Worker).filter(Worker.available.is_(True))
-    if trade.strip(): query = query.filter(Worker.trade.ilike(f"%{trade.strip()}%"))
-    if location.strip(): query = query.filter(Worker.location.ilike(f"%{location.strip()}%"))
-    if min_experience > 0: query = query.filter(Worker.experience >= min_experience)
-    favorite_ids = {row.worker_id for row in db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).all()}
+    favorite_rows = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).all()
+    favorite_ids = {row.worker_id for row in favorite_rows}
+    favorite_labels = {row.worker_id: row.label for row in favorite_rows if (row.label or "").strip()}
+    if favorites == "yes":
+        query = db.query(Worker).filter(Worker.id.in_(favorite_ids or [-1]))
+    else:
+        query = db.query(Worker).filter(Worker.available.is_(True))
+    if trade.strip():
+        query = query.filter(Worker.trade.ilike(f"%{trade.strip()}%"))
+    if location.strip():
+        query = query.filter(Worker.location.ilike(f"%{location.strip()}%"))
+    if min_experience > 0:
+        query = query.filter(Worker.experience >= min_experience)
     workers = query.order_by(Worker.experience.desc(), Worker.id.desc()).limit(200).all()
-    if favorites == "yes": workers = [w for w in workers if w.id in favorite_ids]
-    open_jobs = db.query(ManpowerRequest).filter(ManpowerRequest.user_id == user.id, ManpowerRequest.status == "open").order_by(ManpowerRequest.id.desc()).all()
-    return templates.TemplateResponse("talent.html", {"request": request, "user": user, "workers": workers, "favorite_ids": favorite_ids, "jobs": open_jobs, "trade_filter": trade, "location_filter": location, "min_experience": min_experience, "favorites_filter": favorites})
+    open_jobs = contractor_open_jobs(db, user.id)
+    return templates.TemplateResponse("talent.html", {"request": request, "user": user, "workers": workers, "favorite_ids": favorite_ids, "favorite_labels": favorite_labels, "jobs": open_jobs, "trade_filter": trade, "location_filter": location, "min_experience": min_experience, "favorites_filter": favorites})
+
+
+@app.get("/saved", response_class=HTMLResponse)
+def saved_candidates(request: Request, label: str = "", trade: str = "", db: Session = Depends(get_db)):
+    user = require_user(request, db, "contractor")
+    label_filter = (label or "").strip()
+    trade_filter = (trade or "").strip()
+    favorites = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id).order_by(FavoriteCandidate.created_at.desc(), FavoriteCandidate.id.desc()).all()
+    workers_by_id = {w.id: w for w in db.query(Worker).filter(Worker.id.in_([row.worker_id for row in favorites] or [-1])).all()}
+    needle = trade_filter.lower()
+    rows = []
+    for favorite in favorites:
+        worker = workers_by_id.get(favorite.worker_id)
+        if not worker:
+            continue
+        if label_filter and (favorite.label or "") != label_filter:
+            continue
+        if needle and needle not in (worker.trade or "").lower():
+            continue
+        relationship = can_message(db, user.id, worker.user_id) if worker.user_id else None
+        rows.append({"worker": worker, "label": favorite.label or "", "note_preview": saved_note_preview(favorite.note), "can_message": relationship is not None})
+    return templates.TemplateResponse("saved.html", {"request": request, "user": user, "rows": rows, "jobs": contractor_open_jobs(db, user.id), "label_filter": label_filter, "trade_filter": trade_filter, "has_saved": bool(favorites), "return_path": saved_return_path(label_filter, trade_filter)})
+
+
+@app.post("/saved/{worker_id}")
+def update_saved_candidate(worker_id: int, request: Request, note: str = Form(""), label: str = Form(""), return_to: str = Form(""), db: Session = Depends(get_db)):
+    user = require_user(request, db, "contractor")
+    favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
+    if not favorite:
+        raise HTTPException(status_code=404, detail="Saved candidate not found")
+    clean_label = normalize_saved_label(label)
+    clean_note = normalize_saved_note(note)
+    favorite.label = clean_label
+    favorite.note = clean_note
+    db.commit()
+    destination = safe_app_path(return_to) or f"/worker/{worker_id}"
+    return RedirectResponse(destination, status_code=303)
 
 
 @app.post("/favorite/{worker_id}")
-def toggle_favorite(worker_id: int, request: Request, db: Session = Depends(get_db)):
+def toggle_favorite(worker_id: int, request: Request, return_to: str = Form(""), db: Session = Depends(get_db)):
     user = require_user(request, db, "contractor")
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
-    if not worker: raise HTTPException(status_code=404, detail="Worker not found")
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
     favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
-    if favorite: db.delete(favorite)
-    else: db.add(FavoriteCandidate(contractor_user_id=user.id, worker_id=worker_id))
+    if favorite:
+        db.delete(favorite)
+    else:
+        db.add(FavoriteCandidate(contractor_user_id=user.id, worker_id=worker_id))
     db.commit()
-    return RedirectResponse(request.headers.get("referer") or "/talent", status_code=303)
+    destination = safe_app_path(return_to) or request.headers.get("referer") or "/talent"
+    return RedirectResponse(destination, status_code=303)
 
 
 @app.get("/company", response_class=HTMLResponse)
@@ -742,7 +851,7 @@ def worker_profile_page(worker_id: int, request: Request, db: Session = Depends(
     if not worker: raise HTTPException(status_code=404, detail="Worker not found")
     favorite = db.query(FavoriteCandidate).filter(FavoriteCandidate.contractor_user_id == user.id, FavoriteCandidate.worker_id == worker_id).first()
     relationship = can_message(db, user.id, worker.user_id) if worker.user_id else None
-    return templates.TemplateResponse("worker_profile.html", {"request": request, "user": user, "worker": worker, "favorite": bool(favorite), "relationship": relationship})
+    return templates.TemplateResponse("worker_profile.html", {"request": request, "user": user, "worker": worker, "favorite": bool(favorite), "saved": favorite, "relationship": relationship})
 
 
 @app.get("/contractor/worker/{worker_id}/document/{kind}")
@@ -883,7 +992,7 @@ def health():
     try:
         with engine.connect() as conn: conn.execute(text("SELECT 1"))
         database = "postgresql" if engine.dialect.name == "postgresql" else "sqlite"
-        features = ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search"]
+        features = ["messaging", "notifications", "talent-search", "favorites", "company-profiles", "opportunity-search", "saved-workspace"]
         if CSRF_PROTECTION == "enabled":
             features.append("csrf")
         if RATE_LIMIT != "disabled":
@@ -892,7 +1001,7 @@ def health():
             "status": "ok",
             "service": "TradeForce AI",
             "database": database,
-            "phase": 14,
+            "phase": 15,
             "document_storage": "object-storage" if storage_enabled() else "database-fallback",
             "csrf": CSRF_PROTECTION,
             "rate_limit": RATE_LIMIT,
